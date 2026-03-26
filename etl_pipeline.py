@@ -1,26 +1,23 @@
-"""
-ETL Pipeline: Database A → Process → Finance Database
+"""Main ETL orchestrator for callback-based sales modules."""
 
-Flow:
-    1. EXTRACT  — Read raw data from source database (Database A)
-    2. TRANSFORM — Process, clean, calculate
-    3. LOAD — Insert results into finance database
+from __future__ import annotations
 
-Dependencies:
-    pip install mysql-connector-python pandas sqlalchemy
-
-Usage:
-    python etl_pipeline.py
-"""
-
-import os
-import pandas as pd
-from sqlalchemy import create_engine, text
-from datetime import datetime, timezone
-from dotenv import load_dotenv
+import json
 import logging
+import os
+from datetime import datetime, timezone
 
-from transforms import transform
+import pandas as pd
+from dotenv import load_dotenv
+from sqlalchemy import create_engine, text
+from sqlalchemy.orm import sessionmaker
+
+from load.sales_module_loader import process_records_by_module
+from transforms import (
+    transform_receivable_payment_source_record,
+    transform_sales_invoice_source_record,
+    transform_sales_return_source_record,
+)
 
 load_dotenv()
 
@@ -28,7 +25,6 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-# Source: Database A
 SOURCE_DB = {
     "host": os.getenv("SOURCE_DB_HOST", "localhost"),
     "port": int(os.getenv("SOURCE_DB_PORT", "3306")),
@@ -37,7 +33,6 @@ SOURCE_DB = {
     "database": os.getenv("SOURCE_DB_NAME", "database_a"),
 }
 
-# Destination: Finance Database
 FINANCE_DB = {
     "host": os.getenv("FINANCE_DB_HOST", "localhost"),
     "port": int(os.getenv("FINANCE_DB_PORT", "3306")),
@@ -46,7 +41,25 @@ FINANCE_DB = {
     "database": os.getenv("FINANCE_DB_NAME", "finance_db"),
 }
 
-# Logging
+SOURCE_DB_URL = os.getenv("SOURCE_DB_URL")
+FINANCE_DB_URL = os.getenv("FINANCE_DB_URL")
+SOURCE_CALLBACK_TABLE = os.getenv("SOURCE_CALLBACK_TABLE", "callback_zahir")
+LIMIT_PER_MODULE = int(os.getenv("ETL_LIMIT_PER_MODULE", "200"))
+CHUNK_SIZE = int(os.getenv("ETL_CHUNK_SIZE", "500"))
+
+MODULE_TRANSFORMERS = {
+    "sales_invoice": transform_sales_invoice_source_record,
+    "receivable_payment": transform_receivable_payment_source_record,
+    "sales_return": transform_sales_return_source_record,
+}
+
+ENDPOINT_MAP = {
+    "sales_invoice": "sales_invoices",
+    "receivable_payment": "receivable_payments",
+    "sales_return": "sales_returns",
+}
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -62,91 +75,111 @@ log = logging.getLogger(__name__)
 # HELPERS
 # ============================================================
 
+
 def get_engine(config: dict):
     """Create SQLAlchemy engine from config dict."""
-    url = f"mysql+mysqlconnector://{config['user']}:{config['password']}@{config['host']}:{config['port']}/{config['database']}"
-    return create_engine(url)
+    url = (
+        f"mysql+mysqlconnector://{config['user']}:{config['password']}"
+        f"@{config['host']}:{config['port']}/{config['database']}"
+    )
+    return create_engine(url, future=True)
 
 
-# ============================================================
-# 1. EXTRACT — Read from Database A
-# ============================================================
+def get_source_engine():
+    """Build source DB engine using SOURCE_DB_URL if provided."""
+    if SOURCE_DB_URL:
+        return create_engine(SOURCE_DB_URL, future=True)
+    return get_engine(SOURCE_DB)
 
-def extract(engine) -> pd.DataFrame:
-    """
-    Pull transactions joined with product and customer info from database_a.
-    Only grabs the last 7 days to keep incremental loads fast.
-    """
-    query = """
+
+def get_finance_engine():
+    """Build finance DB engine using FINANCE_DB_URL if provided."""
+    if FINANCE_DB_URL:
+        return create_engine(FINANCE_DB_URL, future=True)
+    return get_engine(FINANCE_DB)
+
+
+def parse_callback_body(raw_body):
+    """Parse callback body safely, including double-encoded JSON."""
+    if raw_body is None:
+        return None
+
+    if isinstance(raw_body, dict):
+        return raw_body
+
+    if not isinstance(raw_body, str):
+        return None
+
+    try:
+        payload = json.loads(raw_body)
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+def extract_source_records(source_engine, module_name: str, limit: int) -> list[dict]:
+    """Extract raw callback records and keep only target module endpoint."""
+    endpoint = ENDPOINT_MAP[module_name]
+
+    sql = text(
+        f"""
         SELECT
-            t.id            AS transaction_id,
-            t.customer_id,
-            c.name          AS customer_name,
-            t.product_id,
-            p.name          AS product_name,
-            p.category      AS product_category,
-            t.quantity,
-            t.unit_price,
-            t.total_amount,
-            t.status,
-            t.created_at
-        FROM transactions t
-        JOIN customers c ON c.id = t.customer_id
-        JOIN products  p ON p.id = t.product_id
-        WHERE t.created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
-    """
+            id AS callback_id,
+            body,
+            created_at
+        FROM {SOURCE_CALLBACK_TABLE}
+        WHERE body IS NOT NULL
+        ORDER BY created_at DESC
+        LIMIT :limit_n
+        """
+    )
 
-    df = pd.read_sql(query, engine)
-    log.info(f"EXTRACT: {len(df)} rows from source DB")
-    return df
+    fetch_limit = max(limit * 30, 300)
+    df = pd.read_sql(sql, source_engine, params={"limit_n": fetch_limit})
+
+    records = []
+    for rec in df.to_dict(orient="records"):
+        payload = parse_callback_body(rec.get("body"))
+        if not payload:
+            continue
+
+        if payload.get("end_point") == endpoint:
+            records.append(rec)
+
+        if len(records) >= limit:
+            break
+
+    return records
 
 
 # ============================================================
-# 3. LOAD — Insert into Finance Database
+# LEGACY LOAD HELPERS (kept for compatibility with tests)
 # ============================================================
+
 
 def load(df: pd.DataFrame, engine, table_name: str, mode: str = "append"):
-    """
-    Insert processed data into finance database.
-
-    Args:
-        mode:
-            "append"  — Add new rows (default, safe for incremental loads)
-            "replace" — Drop table & recreate (full refresh, use with caution)
-
-    For large datasets, chunk the insert to avoid memory/timeout issues.
-    """
+    """Insert DataFrame into target table."""
     chunk_size = 5000
 
     df.to_sql(
         name=table_name,
         con=engine,
-        if_exists=mode,       # "append" or "replace"
+        if_exists=mode,
         index=False,
         chunksize=chunk_size,
-        method="multi",       # faster bulk insert
+        method="multi",
     )
 
-    log.info(f"LOAD: {len(df)} rows → finance_db.{table_name} (mode={mode})")
+    log.info("LOAD: %s rows -> %s (mode=%s)", len(df), table_name, mode)
 
 
 def load_with_upsert(df: pd.DataFrame, engine, table_name: str, unique_keys: list[str]):
-    """
-    Upsert (insert or update if exists).
-    Use this when you might re-process the same data and want to avoid duplicates.
-
-    Requires a UNIQUE INDEX on the unique_keys columns in the target table.
-    See data/seed_finance_accounts.sql for the index creation.
-
-    Args:
-        unique_keys: List of column names that form the unique constraint,
-                     e.g. ["summary_date", "account_id"]
-    """
-    # Step 1: Load into a temp staging table
+    """Legacy generic upsert utility."""
     staging = f"_staging_{table_name}"
     df.to_sql(staging, engine, if_exists="replace", index=False, method="multi")
 
-    # Step 2: Upsert from staging → target
     columns = ", ".join(df.columns)
     update_cols = [col for col in df.columns if col not in unique_keys]
     updates = ", ".join([f"{col}=VALUES({col})" for col in update_cols])
@@ -161,47 +194,119 @@ def load_with_upsert(df: pd.DataFrame, engine, table_name: str, unique_keys: lis
         conn.execute(text(upsert_sql))
         conn.execute(text(f"DROP TABLE IF EXISTS {staging}"))
 
-    log.info(f"UPSERT: {len(df)} rows → finance_db.{table_name}")
+    log.info("UPSERT: %s rows -> %s", len(df), table_name)
+
+
+def _parse_modules_from_env() -> list[str]:
+    module_names = os.getenv("ETL_MODULES", "sales_invoice,receivable_payment,sales_return")
+    requested = [m.strip() for m in module_names.split(",") if m.strip()]
+    valid_modules = [m for m in requested if m in MODULE_TRANSFORMERS]
+
+    unknown_modules = sorted(set(requested) - set(valid_modules))
+    if unknown_modules:
+        log.warning("Unknown ETL modules ignored: %s", ", ".join(unknown_modules))
+
+    return valid_modules
+
+
+def run_module_etl(source_engine, finance_session_factory, module_name: str, limit: int):
+    """Run ETL flow for one sales module."""
+    transform_func = MODULE_TRANSFORMERS[module_name]
+    source_records = extract_source_records(source_engine, module_name=module_name, limit=limit)
+
+    if not source_records:
+        log.info("%s: no source records found", module_name)
+        return {
+            "input_records": 0,
+            "success_records": 0,
+            "failed_records": 0,
+            "processed_rows": 0,
+        }
+
+    log.info("%s: extracted %s source records", module_name, len(source_records))
+
+    with finance_session_factory() as session:
+        result = process_records_by_module(
+            session=session,
+            module_name=module_name,
+            source_records=source_records,
+            transform_func=transform_func,
+            chunk_size=CHUNK_SIZE,
+        )
+        session.commit()
+
+    log.info(
+        "%s: success=%s failed=%s rows=%s",
+        module_name,
+        result.get("success_records", 0),
+        result.get("failed_records", 0),
+        result.get("processed_rows", 0),
+    )
+
+    if result.get("failed_detail"):
+        sample = result["failed_detail"][:5]
+        log.warning("%s: sample failed detail: %s", module_name, sample)
+
+    return result
 
 
 # ============================================================
 # MAIN PIPELINE
 # ============================================================
 
-def run_pipeline():
-    log.info("=" * 50)
-    log.info("ETL Pipeline started")
-    log.info("=" * 50)
 
-    source_engine = get_engine(SOURCE_DB)
-    finance_engine = get_engine(FINANCE_DB)
+def run_pipeline():
+    """Run callback-based ETL for selected finance modules."""
+    modules = _parse_modules_from_env()
+    if not modules:
+        log.warning("No valid modules configured. Nothing to run.")
+        return
+
+    source_engine = get_source_engine()
+    finance_engine = get_finance_engine()
+    finance_session_factory = sessionmaker(bind=finance_engine, autoflush=False, autocommit=False, future=True)
+
+    log.info("=" * 60)
+    log.info("ETL Pipeline started (modules: %s)", ", ".join(modules))
+    log.info("=" * 60)
+
+    total_records = 0
+    total_failed = 0
+    total_rows = 0
+    module_summaries = []
 
     try:
-        # 1. Extract
-        df = extract(source_engine)
+        for module_name in modules:
+            result = run_module_etl(
+                source_engine=source_engine,
+                finance_session_factory=finance_session_factory,
+                module_name=module_name,
+                limit=LIMIT_PER_MODULE,
+            )
+            module_summaries.append((module_name, result))
+            total_records += result.get("input_records", 0)
+            total_failed += result.get("failed_records", 0)
+            total_rows += result.get("processed_rows", 0)
 
-        if df.empty:
-            log.info("No data to process. Exiting.")
-            return
+        for module_name, result in module_summaries:
+            log.info(
+                "Module summary [%s]: input=%s success=%s failed=%s rows=%s",
+                module_name,
+                result.get("input_records", 0),
+                result.get("success_records", 0),
+                result.get("failed_records", 0),
+                result.get("processed_rows", 0),
+            )
 
-        # 2. Transform
-        df = transform(df)
-
-        if df.empty:
-            log.info("No completed transactions to load. Exiting.")
-            return
-
-        # 3. Load (upsert so re-runs update instead of duplicating)
-        load_with_upsert(
-            df, finance_engine,
-            table_name="finance_summary",
-            unique_keys=["summary_date", "account_id"],
+        log.info(
+            "Pipeline finished: input_records=%s failed_records=%s processed_rows=%s",
+            total_records,
+            total_failed,
+            total_rows,
         )
 
-        log.info("✅ Pipeline completed successfully")
-
     except Exception as e:
-        log.error(f"❌ Pipeline failed: {e}", exc_info=True)
+        log.error("Pipeline failed: %s", e, exc_info=True)
         raise
 
     finally:

@@ -16,26 +16,17 @@ test:
 # --- Migrations ---
 
 # Apply all pending migrations to both databases
-migrate: migrate-source migrate-finance
-
-migrate-source:
-	venv/bin/alembic -c alembic/source/alembic.ini upgrade head
+migrate: migrate-finance
 
 migrate-finance:
 	venv/bin/alembic -c alembic/finance/alembic.ini upgrade head
 
 # Rollback the last migration
-rollback-source:
-	venv/bin/alembic -c alembic/source/alembic.ini downgrade -1
-
 rollback-finance:
 	venv/bin/alembic -c alembic/finance/alembic.ini downgrade -1
 
 # Auto-generate a new migration from model changes
 # Usage: make revision-source msg="add index to transactions"
-revision-source:
-	venv/bin/alembic -c alembic/source/alembic.ini revision --autogenerate -m "$(msg)"
-
 revision-finance:
 	venv/bin/alembic -c alembic/finance/alembic.ini revision --autogenerate -m "$(msg)"
 
