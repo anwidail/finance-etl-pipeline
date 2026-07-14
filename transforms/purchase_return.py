@@ -4,7 +4,7 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
-from transforms.tax_master import resolve_tax_account
+from transforms.tax_master import resolve_discount_account, resolve_tax_account
 
 
 def to_decimal(value: Any, default: str = "0") -> Decimal:
@@ -203,11 +203,18 @@ def transform_purchase_return(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "exchange_rate": to_decimal(line.get("exchange_rate", base["exchange_rate"])),
         }
 
-        purchase_reversal = to_decimal(
+        # The expense reversal is credited GROSS (pre-discount subtotal) and the
+        # line discount is reversed with a DEBIT to W/H TA 23 — the mirror of the
+        # purchase invoice, which credits it. Grossing up and debiting the same
+        # discount offsets exactly, so a zero discount is a plain net reversal.
+        before_amount = to_decimal(line.get("subtotal_before_discount"))
+        after_amount = to_decimal(
             line.get("subtotal_after_discount")
             if line.get("subtotal_after_discount") is not None
             else line.get("subtotal_before_discount")
         )
+        purchase_reversal = before_amount
+        discount_amount = before_amount - after_amount
         account_code = to_str(acc.get("code"))
 
         if purchase_reversal != 0:
@@ -220,6 +227,19 @@ def transform_purchase_return(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "account_code": account_code,
                 "coa_name": acc.get("name"),
                 "source_line_id": to_str(line.get("id")),
+            })
+
+        if discount_amount != 0:
+            disc_code, disc_coa_name = resolve_discount_account("purchase")
+            rows.append({
+                **line_base,
+                "note": "Discount",
+                "debit": discount_amount,
+                "credit": Decimal("0"),
+                "realization": compute_realization(disc_code, discount_amount, Decimal("0")),
+                "account_code": disc_code,
+                "coa_name": disc_coa_name,
+                "source_line_id": f"{to_str(line.get('id'))}_disc",
             })
 
         for tax in line.get("taxes", []) or []:

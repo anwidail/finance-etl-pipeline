@@ -4,13 +4,12 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
+from transforms.tax_master import resolve_discount_account
+
 
 # ============================================================
 # CONFIG
 # ============================================================
-
-DISCOUNT_ACCOUNT_CODE = "511999"
-DISCOUNT_ACCOUNT_NAME = "Sales Discount"
 
 # Withholding tax the customer deducts from our receivable (creditable prepaid
 # tax asset on the sales side). coa 1144-11-000 -> normalized gl code 114411.
@@ -358,14 +357,15 @@ def transform_receivable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]
         discount_amount = to_decimal(discount.get("amount"))
 
         if discount_amount != 0:
+            disc_code, disc_coa_name = resolve_discount_account("sales")
             rows.append({
                 **line_base,
                 "note": "Sales Discount",
                 "debit": discount_amount,
                 "credit": Decimal("0"),
-                "realization": compute_realization(DISCOUNT_ACCOUNT_CODE, discount_amount, Decimal("0")),
-                "account_code": DISCOUNT_ACCOUNT_CODE,
-                "coa_name": DISCOUNT_ACCOUNT_NAME,
+                "realization": compute_realization(disc_code, discount_amount, Decimal("0")),
+                "account_code": disc_code,
+                "coa_name": disc_coa_name,
                 "source_line_id": f"{to_str(line.get('id'))}_discount",
             })
 

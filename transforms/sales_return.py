@@ -4,7 +4,7 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
-from transforms.tax_master import resolve_tax_account
+from transforms.tax_master import resolve_discount_account, resolve_tax_account
 
 
 # ============================================================
@@ -217,11 +217,18 @@ def transform_sales_return(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         # payment below is already in base currency (IDR). Convert the line side by
         # the exchange rate so both sides are in IDR and the entry balances. For
         # IDR documents rate == 1, so this is a no-op.
-        revenue_reversal = to_decimal(
+        # The revenue reversal is debited GROSS (pre-discount subtotal) and the
+        # line discount is reversed with a CREDIT to Pre TA 23 — the mirror of the
+        # sales invoice, which debits it. Grossing up and crediting the same
+        # discount offsets exactly, so a zero discount is a plain net reversal.
+        before_amount = to_decimal(line.get("subtotal_before_discount")) * rate
+        after_amount = to_decimal(
             line.get("subtotal_after_discount")
             if line.get("subtotal_after_discount") is not None
             else line.get("subtotal_before_discount")
         ) * rate
+        revenue_reversal = before_amount
+        discount_amount = before_amount - after_amount
 
         account_code = to_str(acc.get("code"))
 
@@ -239,6 +246,19 @@ def transform_sales_return(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 # would collide on the (source_id, source_line_id) key at load and
                 # silently drop one side, unbalancing the entry).
                 "source_line_id": f"{to_str(line.get('id'))}_rev",
+            })
+
+        if discount_amount != 0:
+            disc_code, disc_coa_name = resolve_discount_account("sales")
+            rows.append({
+                **line_base,
+                "note": "Discount",
+                "debit": Decimal("0"),
+                "credit": discount_amount,
+                "realization": compute_realization(disc_code, Decimal("0"), discount_amount),
+                "account_code": disc_code,
+                "coa_name": disc_coa_name,
+                "source_line_id": f"{to_str(line.get('id'))}_disc",
             })
 
         # ========================================================

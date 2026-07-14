@@ -4,9 +4,8 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
+from transforms.tax_master import resolve_discount_account
 
-DISCOUNT_ACCOUNT_CODE = "511998"
-DISCOUNT_ACCOUNT_NAME = "Purchase Discount"
 
 # Withholding tax we deduct from the supplier and owe to the tax office (a
 # liability on the purchase side). coa 2124-23-000 -> normalized gl code 212423.
@@ -304,14 +303,15 @@ def transform_payable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         discount_amount = to_decimal(discount.get("amount"))
 
         if discount_amount != 0:
+            disc_code, disc_coa_name = resolve_discount_account("purchase")
             rows.append({
                 **line_base,
                 "note": "Purchase Discount",
                 "debit": Decimal("0"),
                 "credit": discount_amount,
-                "realization": compute_realization(DISCOUNT_ACCOUNT_CODE, Decimal("0"), discount_amount),
-                "account_code": DISCOUNT_ACCOUNT_CODE,
-                "coa_name": DISCOUNT_ACCOUNT_NAME,
+                "realization": compute_realization(disc_code, Decimal("0"), discount_amount),
+                "account_code": disc_code,
+                "coa_name": disc_coa_name,
                 "source_line_id": f"{to_str(line.get('id'))}_discount",
             })
 
