@@ -55,6 +55,26 @@ TAX_MASTER = {
 }
 
 
+# ============================================================
+# DISCOUNT
+# ============================================================
+# Line-level discounts are booked as a withholding-style adjustment to the same
+# PPh 23 accounts used by the tax master: on a purchase the discount is a credit
+# to W/H TA 23 (a payable to the tax office), on a sale it is a debit to Pre TA
+# 23 (a prepaid-tax asset). The line's revenue/expense side is grossed up to the
+# pre-discount subtotal so the entry still balances exactly.
+DISCOUNT_ACCOUNT = {
+    "purchase": {"account_code": "212423", "coa_name": "W/H TA 23 (Supplier/Vendor)"},
+    "sales": {"account_code": "114411", "coa_name": "Pre TA 23 (Cust./Client)"},
+}
+
+
+def resolve_discount_account(side: str) -> Tuple[Optional[str], Optional[str]]:
+    """Resolve (account_code, coa_name) for a line discount by side."""
+    acc = DISCOUNT_ACCOUNT.get(side, {})
+    return acc.get("account_code"), acc.get("coa_name")
+
+
 def resolve_tax_account(tax_obj: Dict[str, Any], side: str) -> Tuple[Optional[str], Optional[str]]:
     """Resolve (account_code, coa_name) for a tax object and side.
 

@@ -4,7 +4,7 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
-from transforms.tax_master import resolve_tax_account
+from transforms.tax_master import resolve_discount_account, resolve_tax_account
 
 
 def to_decimal(value: Any, default: str = "0") -> Decimal:
@@ -184,11 +184,19 @@ def transform_purchase_invoice(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         # payment side below uses the base-currency `amount`. Convert the debit
         # side to base currency so the journal balances. For base-currency
         # invoices the exchange rate is 1, leaving the value unchanged.
-        purchase_amount = to_decimal(
+        #
+        # The expense is booked GROSS (at the pre-discount subtotal) and the line
+        # discount is posted separately to W/H TA 23 as a credit. Grossing up and
+        # crediting the same discount offsets exactly, so a zero discount leaves
+        # the entry identical to a plain net posting.
+        before_amount = to_decimal(line.get("subtotal_before_discount"))
+        after_amount = to_decimal(
             line.get("subtotal_after_discount")
             if line.get("subtotal_after_discount") is not None
             else line.get("subtotal_before_discount")
-        ) * line_xr
+        )
+        purchase_amount = before_amount * line_xr
+        discount_amount = (before_amount - after_amount) * line_xr
         account_code = to_str(acc.get("code"))
 
         if purchase_amount != 0:
@@ -201,6 +209,19 @@ def transform_purchase_invoice(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "account_code": account_code,
                 "coa_name": acc.get("name"),
                 "source_line_id": to_str(line.get("id")),
+            })
+
+        if discount_amount != 0:
+            disc_code, disc_coa_name = resolve_discount_account("purchase")
+            rows.append({
+                **line_base,
+                "note": "Discount",
+                "debit": Decimal("0"),
+                "credit": discount_amount,
+                "realization": compute_realization(disc_code, Decimal("0"), discount_amount),
+                "account_code": disc_code,
+                "coa_name": disc_coa_name,
+                "source_line_id": f"{to_str(line.get('id'))}_disc",
             })
 
         for tax in line.get("taxes", []) or []:
