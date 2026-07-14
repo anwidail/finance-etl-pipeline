@@ -5,40 +5,30 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
 
-# ============================================================
-# CONFIG
-# ============================================================
+DISCOUNT_ACCOUNT_CODE = "511998"
+DISCOUNT_ACCOUNT_NAME = "Purchase Discount"
 
-DISCOUNT_ACCOUNT_CODE = "511999"
-DISCOUNT_ACCOUNT_NAME = "Sales Discount"
+# Withholding tax we deduct from the supplier and owe to the tax office (a
+# liability on the purchase side). coa 2124-23-000 -> normalized gl code 212423.
+WHT_ACCOUNT_CODE = "212423"
+WHT_ACCOUNT_NAME = "W/H TA 23 (Supplier/Vendor)"
 
-# Withholding tax the customer deducts from our receivable (creditable prepaid
-# tax asset on the sales side). coa 1144-11-000 -> normalized gl code 114411.
-WHT_ACCOUNT_CODE = "114411"
-WHT_ACCOUNT_NAME = "Pre TA 23 (Cust./Client)"
+# Foreign-currency settlements leave a tiny sub-unit residual from Zahir's own
+# rate conversion. Post it as a realized forex gain/loss so the entry balances
+# exactly (coa 8104 / 9104). Capped so a large discrepancy still fails for review.
+FOREX_GAIN_ACCOUNT_CODE = "8104"
+FOREX_GAIN_ACCOUNT_NAME = "Realize Forex Gain"
+FOREX_LOSS_ACCOUNT_CODE = "9104"
+FOREX_LOSS_ACCOUNT_NAME = "Realize Forex Loss"
+FOREX_ROUNDING_MAX_ABS = Decimal("50000")
 
 DEFAULT_CASH_ACCOUNT = {
     "account_code": "111999",
     "coa_name": "Cash/Bank Clearing",
 }
 
-# Bank admin fee the bank deducts from a receipt (not always recorded in the
-# payload), so cash received < amount settled. coa 6924-00-000 -> gl code 6924.
-BANK_CHARGE_ACCOUNT_CODE = "6924"
-BANK_CHARGE_ACCOUNT_NAME = "Bank Administrative"
-# Only auto-post the residual as a bank charge up to this size; a larger gap is a
-# real discrepancy that must surface as an error instead of being masked.
-BANK_CHARGE_MAX_ABS = Decimal("50000")
-
-
-# ============================================================
-# HELPERS
-# ============================================================
 
 def to_decimal(value: Any, default: str = "0") -> Decimal:
-    """
-    Safely convert value to Decimal.
-    """
     if value is None or value == "":
         return Decimal(default)
 
@@ -49,9 +39,6 @@ def to_decimal(value: Any, default: str = "0") -> Decimal:
 
 
 def to_str(value: Any) -> Optional[str]:
-    """
-    Convert any value to string safely.
-    """
     if value is None:
         return None
     return str(value)
@@ -61,9 +48,9 @@ def first_nonzero_amount(*values: Any) -> Decimal:
     """
     Return the first value that converts to a non-zero Decimal.
 
-    The source puts the cleared A/R amount in `payable.amount`, while
+    The source puts the cleared A/P amount in `payable.amount`, while
     `payment.amount` is present but always 0. A plain "first not-None" fallback
-    would wrongly pick that 0 (0 is not None) and skip the A/R line, unbalancing
+    would wrongly pick that 0 (0 is not None) and skip the A/P line, unbalancing
     the journal — so we skip zeros too.
     """
     for value in values:
@@ -74,9 +61,6 @@ def first_nonzero_amount(*values: Any) -> Decimal:
 
 
 def get_nested(d: Dict[str, Any], *keys: str, default=None):
-    """
-    Safe nested getter for dict.
-    """
     current = d
     for key in keys:
         if not isinstance(current, dict):
@@ -87,31 +71,37 @@ def get_nested(d: Dict[str, Any], *keys: str, default=None):
     return current
 
 
+def get_contact_name(data: Dict[str, Any]) -> Optional[str]:
+    return (
+        get_nested(data, "vendor", "name")
+        or get_nested(data, "supplier", "name")
+        or get_nested(data, "contact", "name")
+    )
+
+
+def get_purchase_reference(line: Dict[str, Any]) -> Dict[str, Any]:
+    return (
+        line.get("invoice")
+        or line.get("purchase_invoice")
+        or line.get("purchase")
+        or line.get("bill")
+        or {}
+    )
+
+
 def compute_realization(account_code: Optional[str], debit: Decimal, credit: Decimal) -> Decimal:
-    """
-    Accounting sign convention:
-    - default = debit - credit
-    - groups 2,3,4,8 reversed
-    """
     try:
         first_digit = int(str(account_code)[0]) if account_code else None
     except (ValueError, TypeError, IndexError):
         first_digit = None
 
     base = debit - credit
-
     if first_digit in (2, 3, 4, 8):
         return -base
     return base
 
 
 def parse_json_body(raw_body: Any) -> Dict[str, Any]:
-    """
-    Parse source DB body that may be:
-    - dict
-    - JSON string
-    - double-encoded JSON string
-    """
     if isinstance(raw_body, dict):
         return raw_body
 
@@ -127,7 +117,6 @@ def parse_json_body(raw_body: Any) -> Dict[str, Any]:
 
     try:
         parsed = json.loads(raw_body)
-
         if isinstance(parsed, str):
             parsed = json.loads(parsed)
 
@@ -135,7 +124,6 @@ def parse_json_body(raw_body: Any) -> Dict[str, Any]:
             raise ValueError("parsed body is not a dict")
 
         return parsed
-
     except json.JSONDecodeError as e:
         raise ValueError(f"invalid JSON body: {e}") from e
 
@@ -145,33 +133,23 @@ def reconcile_rows(
     source_id: str,
     tolerance: Decimal = Decimal("0.01"),
 ) -> None:
-    """
-    Ensure total debit equals total credit.
-    """
     total_debit = sum((to_decimal(r.get("debit")) for r in rows), Decimal("0"))
     total_credit = sum((to_decimal(r.get("credit")) for r in rows), Decimal("0"))
     diff = total_debit - total_credit
 
     if abs(diff) > tolerance:
         raise ValueError(
-            f"unbalanced receivable_payment transform for source_id={source_id}: "
+            f"unbalanced payable_payment transform for source_id={source_id}: "
             f"total_debit={total_debit}, total_credit={total_credit}, diff={diff}"
         )
 
 
-# ============================================================
-# VALIDATION
-# ============================================================
-
-def validate_receivable_payment_payload(payload: Dict[str, Any]) -> None:
-    """
-    Validate required fields.
-    """
+def validate_payable_payment_payload(payload: Dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         raise TypeError("payload must be a dict")
 
     end_point = payload.get("end_point")
-    if end_point != "receivable_payments":
+    if end_point != "payable_payments":
         raise ValueError(f"unexpected end_point: {end_point}")
 
     data = payload.get("data")
@@ -182,7 +160,7 @@ def validate_receivable_payment_payload(payload: Dict[str, Any]) -> None:
         "data.id": data.get("id"),
         "data.number": data.get("number"),
         "data.date": data.get("date"),
-        "data.customer.name": get_nested(data, "customer", "name"),
+        "data.vendor.name": get_contact_name(data),
     }
 
     missing = [field for field, value in required_fields.items() if value in (None, "")]
@@ -190,16 +168,7 @@ def validate_receivable_payment_payload(payload: Dict[str, Any]) -> None:
         raise ValueError(f"missing required fields: {', '.join(missing)}")
 
 
-# ============================================================
-# NORMALIZATION
-# ============================================================
-
 def normalize_base_fields(data: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Common fields copied into every generated row.
-    Uses first invoice as default sales reference.
-    """
-    customer = data.get("customer") or {}
     department = data.get("department") or {}
     project = data.get("project") or {}
     currency = data.get("currency") or {}
@@ -207,15 +176,13 @@ def normalize_base_fields(data: Dict[str, Any]) -> Dict[str, Any]:
     created_user = created.get("user") or {}
 
     line_items = data.get("line_items", []) or []
-    first_invoice = {}
-    if line_items:
-        first_invoice = (line_items[0] or {}).get("invoice", {}) or {}
+    first_purchase = get_purchase_reference(line_items[0]) if line_items else {}
 
     return {
         "date": data.get("date"),
-        "type": "receivable_payments",
+        "type": "payable_payments",
         "ref_no": data.get("number"),
-        "contact": customer.get("name"),
+        "contact": get_contact_name(data),
         "description": data.get("description"),
         "department": department.get("name"),
         "project": project.get("name"),
@@ -225,46 +192,32 @@ def normalize_base_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         "exchange_rate": to_decimal(data.get("exchange_rate", 1)),
         "created_at": created.get("time"),
         "created_by": created_user.get("name"),
-        "sales_ref_no": first_invoice.get("number"),
-        "sales_date": first_invoice.get("date"),
-        "sales_id": first_invoice.get("id"),
+        "purchase_ref_no": first_purchase.get("number"),
+        "purchase_date": first_purchase.get("date"),
+        "purchase_id": first_purchase.get("id"),
     }
 
 
-# ============================================================
-# MAIN TRANSFORM
-# ============================================================
-
-def transform_receivable_payment_from_body(raw_body: Any) -> List[Dict[str, Any]]:
-    """
-    Full entry point:
-    parse raw JSON body -> validate -> transform
-    """
+def transform_payable_payment_from_body(raw_body: Any) -> List[Dict[str, Any]]:
     payload = parse_json_body(raw_body)
-    return transform_receivable_payment(payload)
+    return transform_payable_payment(payload)
 
 
-def transform_receivable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+def transform_payable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Transform one receivable_payments payload into line-level rows.
-
     Journal pattern:
-    1. Debit Cash/Bank from data.cash
-    2. Debit Other expense if data.others.amount is negative
-    3. Credit Other income if data.others.amount is positive
-    4. Debit Discount from line_items[].discount.amount
-    5. Credit A/R from line_items[].payment.amount
+    1. Credit cash / bank from data.cash
+    2. Debit other charge if data.others.amount is positive
+    3. Credit other adjustment if data.others.amount is negative
+    4. Credit purchase discount from line_items[].discount.amount
+    5. Debit A/P from line_items[].payment.amount
     """
-    validate_receivable_payment_payload(payload)
+    validate_payable_payment_payload(payload)
 
     data = payload["data"]
     base = normalize_base_fields(data)
-
     rows: List[Dict[str, Any]] = []
 
-    # ============================================================
-    # 1) DEBIT CASH / BANK
-    # ============================================================
     cash = data.get("cash", {}) or {}
     cash_acc = cash.get("account", {}) or {}
 
@@ -275,10 +228,10 @@ def transform_receivable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]
     if cash_amount != 0:
         rows.append({
             **base,
-            "note": "Cash Receipt",
-            "debit": cash_amount,
-            "credit": Decimal("0"),
-            "realization": compute_realization(cash_code, cash_amount, Decimal("0")),
+            "note": "Cash Payment",
+            "debit": Decimal("0"),
+            "credit": cash_amount,
+            "realization": compute_realization(cash_code, Decimal("0"), cash_amount),
             "account_code": cash_code or DEFAULT_CASH_ACCOUNT["account_code"],
             "coa_name": cash_name,
             "source_line_id": to_str(get_nested(cash, "account", "id")) or "cash",
@@ -286,11 +239,6 @@ def transform_receivable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]
             "exchange_rate": to_decimal(cash.get("exchange_rate", base["exchange_rate"])),
         })
 
-    # ============================================================
-    # 2) OTHERS
-    # negative amount -> debit expense
-    # positive amount -> credit other income / liability reduction
-    # ============================================================
     for other in data.get("others", []) or []:
         other_amount = to_decimal(other.get("amount"))
         if other_amount == 0:
@@ -303,13 +251,13 @@ def transform_receivable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]
         other_exchange_rate = to_decimal(other.get("exchange_rate", base["exchange_rate"]))
 
         if other_amount < 0:
-            debit = abs(other_amount)
+            debit = Decimal("0")
+            credit = abs(other_amount)
+            note = "Other Adjustment"
+        else:
+            debit = other_amount
             credit = Decimal("0")
             note = "Other Charge"
-        else:
-            debit = Decimal("0")
-            credit = other_amount
-            note = "Other Adjustment"
 
         rows.append({
             **base,
@@ -324,21 +272,20 @@ def transform_receivable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]
             "exchange_rate": other_exchange_rate,
         })
 
-    # ============================================================
-    # 3) LINE ITEMS
-    # discount + credit A/R
-    # ============================================================
     for line in data.get("line_items", []) or []:
-        inv = line.get("invoice", {}) or {}
-        ar_acc = inv.get("account", {}) or {}
+        purchase = get_purchase_reference(line)
+        ap_acc = (
+            get_nested(line, "payable", "account")
+            or purchase.get("account")
+            or {}
+        )
 
-        invoice_no = inv.get("number")
-        invoice_date = inv.get("date")
-        invoice_id = inv.get("id")
+        purchase_no = purchase.get("number")
+        purchase_date = purchase.get("date")
+        purchase_id = purchase.get("id")
 
         dept = line.get("department") or data.get("department") or {}
         proj = line.get("project") or data.get("project") or {}
-
         line_currency = get_nested(line, "currency", "code", default=base["currency"]) or base["currency"]
         line_exchange_rate = to_decimal(line.get("exchange_rate", base["exchange_rate"]))
 
@@ -348,58 +295,56 @@ def transform_receivable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]
             "project": proj.get("name"),
             "currency": line_currency,
             "exchange_rate": line_exchange_rate,
-            "sales_ref_no": invoice_no,
-            "sales_date": invoice_date,
-            "sales_id": invoice_id,
+            "purchase_ref_no": purchase_no,
+            "purchase_date": purchase_date,
+            "purchase_id": purchase_id,
         }
 
-        # 3a) Debit Discount
         discount = line.get("discount", {}) or {}
         discount_amount = to_decimal(discount.get("amount"))
 
         if discount_amount != 0:
             rows.append({
                 **line_base,
-                "note": "Sales Discount",
-                "debit": discount_amount,
-                "credit": Decimal("0"),
-                "realization": compute_realization(DISCOUNT_ACCOUNT_CODE, discount_amount, Decimal("0")),
+                "note": "Purchase Discount",
+                "debit": Decimal("0"),
+                "credit": discount_amount,
+                "realization": compute_realization(DISCOUNT_ACCOUNT_CODE, Decimal("0"), discount_amount),
                 "account_code": DISCOUNT_ACCOUNT_CODE,
                 "coa_name": DISCOUNT_ACCOUNT_NAME,
                 "source_line_id": f"{to_str(line.get('id'))}_discount",
             })
 
-        # 3b/3c) Settle A/R by the amount ACTUALLY paid this time. Payments can be
-        # partial — one invoice may be paid over several installments — so we must
-        # NOT credit the full invoice value (payable.amount, a reference only).
-        # Amount settled this payment = net cash for the line + discount taken +
-        # tax the customer withheld. That equals the sum of the debit lines, so
-        # the entry balances.
+        # Settle A/P by the amount ACTUALLY paid this time. Payments can be
+        # partial — one bill may be paid over several installments — so we must
+        # NOT debit the full bill value (payable.amount, a reference only). Amount
+        # settled this payment = net cash for the line + discount taken + tax we
+        # withheld. That equals the sum of the credit lines, so the entry balances.
         payable_amt = to_decimal(get_nested(line, "payable", "amount"))
         payment_amt = to_decimal(get_nested(line, "payment", "amount"))
         net_cash = to_decimal(line.get("amount"))
 
         if net_cash == 0:
             # No explicit per-line net cash -> full settlement of the line's gross.
-            ar_settled = first_nonzero_amount(payable_amt, payment_amt)
+            ap_settled = first_nonzero_amount(payable_amt, payment_amt)
             wht_amount = Decimal("0")
         else:
             # payment.amount is the withholding tax only when it is a distinct
             # component (payment == payable just duplicates the gross -> no tax).
             wht_amount = payment_amt if (payment_amt != 0 and payment_amt != payable_amt) else Decimal("0")
-            ar_settled = net_cash + discount_amount + wht_amount
+            ap_settled = net_cash + discount_amount + wht_amount
 
-        ar_code = to_str(ar_acc.get("code"))
+        ap_code = to_str(ap_acc.get("code"))
 
-        if ar_settled != 0:
+        if ap_settled != 0:
             rows.append({
                 **line_base,
-                "note": "Accounts Receivable (Payment)",
-                "debit": Decimal("0"),
-                "credit": ar_settled,
-                "realization": compute_realization(ar_code, Decimal("0"), ar_settled),
-                "account_code": ar_code,
-                "coa_name": ar_acc.get("name"),
+                "note": "Accounts Payable (Payment)",
+                "debit": ap_settled,
+                "credit": Decimal("0"),
+                "realization": compute_realization(ap_code, ap_settled, Decimal("0")),
+                "account_code": ap_code,
+                "coa_name": ap_acc.get("name"),
                 "source_line_id": to_str(line.get("id")),
             })
 
@@ -407,57 +352,45 @@ def transform_receivable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]
             rows.append({
                 **line_base,
                 "note": "Withholding Tax (PPh 23)",
-                "debit": wht_amount,
-                "credit": Decimal("0"),
-                "realization": compute_realization(WHT_ACCOUNT_CODE, wht_amount, Decimal("0")),
+                "debit": Decimal("0"),
+                "credit": wht_amount,
+                "realization": compute_realization(WHT_ACCOUNT_CODE, Decimal("0"), wht_amount),
                 "account_code": WHT_ACCOUNT_CODE,
                 "coa_name": WHT_ACCOUNT_NAME,
                 "source_line_id": f"{to_str(line.get('id'))}_wht",
             })
 
     if not rows:
-        raise ValueError(f"no rows generated for receivable_payment source_id={data.get('id')}")
+        raise ValueError(f"no rows generated for payable_payment source_id={data.get('id')}")
 
-    # Post any small unrecorded bank admin fee: the payment settled the invoices,
-    # but the bank deducted a fee so cash received < amount settled. The residual
-    # is that fee — debit it to Bank Administrative so the entry balances. Capped
-    # so a large discrepancy still surfaces as an error for review.
+    # Absorb small FX rounding: post the residual to realized forex gain/loss so
+    # the entry balances exactly. Capped so a large gap still surfaces as an error.
     total_debit = sum((to_decimal(r.get("debit")) for r in rows), Decimal("0"))
     total_credit = sum((to_decimal(r.get("credit")) for r in rows), Decimal("0"))
-    residual = total_credit - total_debit
-    if residual != 0 and abs(residual) <= BANK_CHARGE_MAX_ABS:
-        debit = residual if residual > 0 else Decimal("0")
-        credit = -residual if residual < 0 else Decimal("0")
+    residual = total_debit - total_credit
+    if residual != 0 and abs(residual) <= FOREX_ROUNDING_MAX_ABS:
+        if residual > 0:
+            # more debit than credit -> add a credit: realized forex gain
+            code, name, debit, credit = FOREX_GAIN_ACCOUNT_CODE, FOREX_GAIN_ACCOUNT_NAME, Decimal("0"), residual
+        else:
+            code, name, debit, credit = FOREX_LOSS_ACCOUNT_CODE, FOREX_LOSS_ACCOUNT_NAME, -residual, Decimal("0")
         rows.append({
             **base,
-            "note": BANK_CHARGE_ACCOUNT_NAME,
+            "note": name,
             "debit": debit,
             "credit": credit,
-            "realization": compute_realization(BANK_CHARGE_ACCOUNT_CODE, debit, credit),
-            "account_code": BANK_CHARGE_ACCOUNT_CODE,
-            "coa_name": BANK_CHARGE_ACCOUNT_NAME,
-            "source_line_id": "bank_charge",
+            "realization": compute_realization(code, debit, credit),
+            "account_code": code,
+            "coa_name": name,
+            "source_line_id": "forex_rounding",
         })
 
     reconcile_rows(rows, source_id=str(data["id"]))
-
     return rows
 
 
-# ============================================================
-# OPTIONAL WRAPPER FOR SOURCE RECORD
-# ============================================================
-
-def transform_receivable_payment_source_record(source_record: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """
-    source_record example:
-    {
-        "callback_id": 12345,
-        "body": "...json string...",
-        "created_at": "2026-03-01 10:00:00"
-    }
-    """
-    rows = transform_receivable_payment_from_body(source_record["body"])
+def transform_payable_payment_source_record(source_record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = transform_payable_payment_from_body(source_record["body"])
 
     for row in rows:
         row["raw_callback_id"] = to_str(source_record.get("callback_id"))

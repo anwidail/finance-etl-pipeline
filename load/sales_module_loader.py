@@ -49,4 +49,5 @@ def process_records_by_module(
         decimal_columns=config["decimal_columns"],
         chunk_size=chunk_size,
         context=config["context"],
+        gl_module_name=module_name,
     )

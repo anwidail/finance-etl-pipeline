@@ -3,8 +3,18 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List
 
+from sqlalchemy import delete, tuple_
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.orm import Session
+
+
+def _is_newer(ts, current) -> bool:
+    """Return True if ts is strictly newer than current, treating None as oldest."""
+    if ts is None:
+        return False
+    if current is None:
+        return True
+    return ts > current
 
 
 def chunked(items: List[Dict[str, Any]], size: int) -> Iterable[List[Dict[str, Any]]]:
@@ -73,6 +83,7 @@ def upsert_rows(
     chunk_size: int = 500,
     auto_commit: bool = False,
     context: str = "",
+    delete_scope_columns: List[str] | None = None,
 ) -> Dict[str, int]:
     """
     Generic bulk upsert for line-level finance tables.
@@ -85,6 +96,7 @@ def upsert_rows(
         }
 
     decimal_columns = decimal_columns or []
+    delete_scope_columns = delete_scope_columns or ["source_id"]
 
     prepared_rows: List[Dict[str, Any]] = []
     for row in rows:
@@ -92,6 +104,32 @@ def upsert_rows(
         db_row = ensure_decimal_defaults(db_row, decimal_columns)
         validate_required_fields(db_row, required_fields, context=context)
         prepared_rows.append(db_row)
+
+    # Replace-by-document: remove any existing rows for the documents in this
+    # batch before re-inserting. Edited invoices arrive as new callbacks whose
+    # line/payment ids differ from the previous version, so a plain upsert keyed
+    # on (source_id, source_line_id) would leave stale rows behind and double the
+    # totals. Deleting up front (once, before the chunk loop so a later chunk's
+    # inserts are not wiped) makes each document a clean replace.
+    #
+    # The scope columns identify a "document". For per-module tables that is just
+    # source_id; for the unified gl table it is (type, source_id) so deleting one
+    # module's document never wipes another module's rows sharing that source_id.
+    scope_keys = set()
+    for r in prepared_rows:
+        vals = tuple(r.get(col) for col in delete_scope_columns)
+        if all(v not in (None, "") for v in vals):
+            scope_keys.add(vals)
+
+    if scope_keys:
+        if len(delete_scope_columns) == 1:
+            col = getattr(model, delete_scope_columns[0])
+            session.execute(delete(model).where(col.in_([k[0] for k in scope_keys])))
+        else:
+            cols = [getattr(model, c) for c in delete_scope_columns]
+            session.execute(
+                delete(model).where(tuple_(*cols).in_([list(k) for k in scope_keys]))
+            )
 
     total_chunks = 0
     total_processed = 0
@@ -122,6 +160,7 @@ def load_module_rows(
     decimal_columns: List[str] | None = None,
     chunk_size: int = 500,
     context: str = "",
+    delete_scope_columns: List[str] | None = None,
 ) -> Dict[str, int]:
     """
     Safe wrapper with transaction handling.
@@ -138,12 +177,43 @@ def load_module_rows(
             chunk_size=chunk_size,
             auto_commit=False,
             context=context,
+            delete_scope_columns=delete_scope_columns,
         )
         session.commit()
         return result
     except Exception:
         session.rollback()
         raise
+
+
+def delete_documents_by_source_id(
+    session: Session,
+    model,
+    source_ids,
+    gl_module_name: str | None = None,
+) -> int:
+    """Remove a document's rows from the module table and the unified ledger.
+
+    Matched strictly on source_id (data.id UUID) — never on voucher number, which
+    is not unique. source_id is globally unique per document, so a plain
+    source_id filter cannot touch another module's rows.
+    """
+    ids = [sid for sid in source_ids if sid not in (None, "")]
+    if not ids:
+        return 0
+
+    try:
+        session.execute(delete(model).where(model.source_id.in_(ids)))
+        if gl_module_name:
+            from models.finance import GeneralLedger
+
+            session.execute(delete(GeneralLedger).where(GeneralLedger.source_id.in_(ids)))
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+
+    return len(ids)
 
 
 def process_source_records(
@@ -157,15 +227,42 @@ def process_source_records(
     decimal_columns: List[str] | None = None,
     chunk_size: int = 500,
     context: str = "",
+    gl_module_name: str | None = None,
 ) -> Dict[str, Any]:
     """
     Generic process:
     source records -> transform -> bulk upsert
+
+    When gl_module_name is set, the same transformed rows are also written to the
+    unified general ledger (gl) so every module posts to a single ledger.
+
+    Callback `method` is honored per document (matched on source_id / data.id):
+    a DELETE whose callback is the latest for a document removes that document's
+    rows (and skips re-inserting them); POST/edit callbacks are transformed and
+    upserted as usual.
     """
+    # Resolve the latest callback method per document (by created_at). A DELETE
+    # that supersedes earlier POST/edit callbacks means the document must be
+    # removed. Matching is on source_id (UUID), not the voucher number.
+    latest_method: Dict[Any, Any] = {}
+    for rec in source_records:
+        sid = rec.get("source_id")
+        if not sid:
+            continue
+        ts = rec.get("created_at")
+        method = (rec.get("method") or "POST").upper()
+        if sid not in latest_method or _is_newer(ts, latest_method[sid][0]):
+            latest_method[sid] = (ts, method)
+    delete_source_ids = {sid for sid, (ts, method) in latest_method.items() if method == "DELETE"}
+
     all_rows: List[Dict[str, Any]] = []
     failed_records: List[Dict[str, Any]] = []
 
     for rec in source_records:
+        # Documents whose latest state is DELETE must not be re-inserted; their
+        # existing rows are removed after the load step below.
+        if rec.get("source_id") in delete_source_ids:
+            continue
         try:
             transformed_rows = transform_func(rec)
             all_rows.extend(transformed_rows)
@@ -183,7 +280,23 @@ def process_source_records(
         "input_rows": 0,
         "processed_rows": 0,
         "chunks": 0,
+        "deleted_documents": 0,
     }
+
+    # A single extract can contain several callbacks for the same document (the
+    # original plus later edits). Keep only the latest version per source_id so
+    # the replace-by-document load below does not re-insert superseded rows.
+    if all_rows:
+        latest_ts: Dict[Any, Any] = {}
+        for row in all_rows:
+            sid = row.get("source_id")
+            ts = row.get("raw_created_at")
+            if sid not in latest_ts or _is_newer(ts, latest_ts[sid]):
+                latest_ts[sid] = ts
+        all_rows = [
+            row for row in all_rows
+            if latest_ts.get(row.get("source_id")) == row.get("raw_created_at")
+        ]
 
     if all_rows:
         load_result = load_module_rows(
@@ -198,5 +311,27 @@ def process_source_records(
             context=context,
         )
         result.update(load_result)
+
+        # Dual-write: post the same rows to the unified general ledger.
+        if gl_module_name:
+            # Local import avoids a circular import (gl_loader imports this module).
+            from load.gl_loader import load_gl_rows
+
+            gl_result = load_gl_rows(
+                session=session,
+                rows=all_rows,
+                module_name=gl_module_name,
+                chunk_size=chunk_size,
+            )
+            result["gl_processed_rows"] = gl_result.get("processed_rows", 0)
+
+    # Apply DELETE callbacks last so a delete always wins over any stale rows.
+    if delete_source_ids:
+        result["deleted_documents"] = delete_documents_by_source_id(
+            session=session,
+            model=model,
+            source_ids=delete_source_ids,
+            gl_module_name=gl_module_name,
+        )
 
     return result

@@ -4,3 +4,5 @@ mysql-connector-python
 python-dotenv
 alembic
 pytest
+dotenv
+pymysql

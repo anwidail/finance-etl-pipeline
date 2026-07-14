@@ -1,19 +1,27 @@
-"""Main ETL orchestrator for callback-based sales modules."""
+"""Main ETL orchestrator for callback-based finance modules."""
 
 from __future__ import annotations
 
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from load.etl_state import get_watermark, set_watermark
+from load.gl_reporting import enrich_gl_reporting_engine
 from load.sales_module_loader import process_records_by_module
 from transforms import (
+    transform_cash_in_source_record,
+    transform_cash_out_source_record,
+    transform_manual_journal_source_record,
+    transform_payable_payment_source_record,
+    transform_purchase_invoice_source_record,
+    transform_purchase_return_source_record,
     transform_receivable_payment_source_record,
     transform_sales_invoice_source_record,
     transform_sales_return_source_record,
@@ -48,16 +56,46 @@ LIMIT_PER_MODULE = int(os.getenv("ETL_LIMIT_PER_MODULE", "200"))
 CHUNK_SIZE = int(os.getenv("ETL_CHUNK_SIZE", "500"))
 
 MODULE_TRANSFORMERS = {
+    "manual_journal": transform_manual_journal_source_record,
     "sales_invoice": transform_sales_invoice_source_record,
     "receivable_payment": transform_receivable_payment_source_record,
     "sales_return": transform_sales_return_source_record,
+    "purchase_invoice": transform_purchase_invoice_source_record,
+    "payable_payment": transform_payable_payment_source_record,
+    "purchase_return": transform_purchase_return_source_record,
+    "cash_in": transform_cash_in_source_record,
+    "cash_out": transform_cash_out_source_record,
 }
 
 ENDPOINT_MAP = {
+    "manual_journal": "manual_journals",
     "sales_invoice": "sales_invoices",
     "receivable_payment": "receivable_payments",
     "sales_return": "sales_returns",
+    "purchase_invoice": "purchases_invoices",
+    "payable_payment": "payable_payments",
+    "purchase_return": "purchases_returns",
+    "cash_in": "cash_ins",
+    "cash_out": "cash_outs",
 }
+
+# Reverse lookup: source endpoint -> module name (for bucketing the delta).
+ENDPOINT_TO_MODULE = {endpoint: module for module, endpoint in ENDPOINT_MAP.items()}
+
+# --- Incremental extraction (watermark) config ---
+# ETL_INCREMENTAL=1 (default): pull only callbacks newer than the stored
+# watermark. Set to 0 to fall back to the legacy "N newest per module" behavior.
+INCREMENTAL = os.getenv("ETL_INCREMENTAL", "1") == "1"
+# Re-scan a small tail before the watermark on each run so rows committed
+# slightly out of timestamp order are not skipped. Idempotent upserts make the
+# overlap harmless.
+WATERMARK_OVERLAP_MINUTES = int(os.getenv("ETL_WATERMARK_OVERLAP_MINUTES", "5"))
+# First run only (no watermark yet): how far back to seed the initial window.
+# Going forward the watermark guarantees completeness; older untouched history
+# is not needed because any later edit arrives as a fresh callback. Set
+# ETL_INITIAL_SINCE=YYYY-MM-DD (or an old date) for an explicit / full backfill.
+INITIAL_SINCE = os.getenv("ETL_INITIAL_SINCE")
+INITIAL_DAYS = int(os.getenv("ETL_INITIAL_DAYS", "45"))
 
 
 logging.basicConfig(
@@ -127,6 +165,7 @@ def extract_source_records(source_engine, module_name: str, limit: int) -> list[
         f"""
         SELECT
             id AS callback_id,
+            method,
             body,
             created_at
         FROM {SOURCE_CALLBACK_TABLE}
@@ -146,12 +185,88 @@ def extract_source_records(source_engine, module_name: str, limit: int) -> list[
             continue
 
         if payload.get("end_point") == endpoint:
+            rec["source_id"] = (payload.get("data") or {}).get("id")
             records.append(rec)
 
         if len(records) >= limit:
             break
 
     return records
+
+
+def _to_naive_datetime(value):
+    """Normalize a pandas/py datetime to a naive python datetime (or None)."""
+    if value is None:
+        return None
+    ts = pd.Timestamp(value)
+    if ts is pd.NaT:
+        return None
+    ts = ts.to_pydatetime()
+    return ts.replace(tzinfo=None) if ts.tzinfo else ts
+
+
+def extract_source_since(source_engine, since, modules: list[str], until=None):
+    """Pull non-deleted callbacks in a created_at window and bucket per module.
+
+    Window is (since, until]: created_at > `since` (or all history when None) and
+    created_at <= `until` (or up to latest when None), in one pass, grouped by
+    target module via the endpoint. Returns (buckets, max_created_at) where
+    max_created_at is the frontier across ALL scanned rows (not just matched
+    modules) — used as the new watermark for continuous runs.
+    """
+    where = ["body IS NOT NULL", "deleted_at IS NULL"]
+    params: dict = {}
+    if since is not None:
+        where.append("created_at > :since")
+        params["since"] = since
+    if until is not None:
+        where.append("created_at <= :until")
+        params["until"] = until
+
+    sql = text(
+        f"""
+        SELECT
+            id AS callback_id,
+            method,
+            body,
+            created_at
+        FROM {SOURCE_CALLBACK_TABLE}
+        WHERE {" AND ".join(where)}
+        ORDER BY created_at ASC
+        """
+    )
+
+    df = pd.read_sql(sql, source_engine, params=params)
+
+    buckets: dict[str, list[dict]] = {module: [] for module in modules}
+    max_created_at = None
+
+    for rec in df.to_dict(orient="records"):
+        created = _to_naive_datetime(rec.get("created_at"))
+        if created is not None and (max_created_at is None or created > max_created_at):
+            max_created_at = created
+
+        payload = parse_callback_body(rec.get("body"))
+        if not payload:
+            continue
+
+        module = ENDPOINT_TO_MODULE.get(payload.get("end_point"))
+        if module in buckets:
+            # Attach the document id (data.id UUID) and HTTP method so the loader
+            # can apply DELETE / edit semantics keyed strictly on source_id.
+            rec["source_id"] = (payload.get("data") or {}).get("id")
+            buckets[module].append(rec)
+
+    return buckets, max_created_at
+
+
+def _resolve_initial_since():
+    """Lower bound for the very first run (no watermark yet)."""
+    if INITIAL_SINCE:
+        # Explicit override, e.g. "2026-01-01" or "1970-01-01" for a full backfill.
+        return datetime.fromisoformat(INITIAL_SINCE)
+    now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    return now_naive - timedelta(days=INITIAL_DAYS)
 
 
 # ============================================================
@@ -198,7 +313,10 @@ def load_with_upsert(df: pd.DataFrame, engine, table_name: str, unique_keys: lis
 
 
 def _parse_modules_from_env() -> list[str]:
-    module_names = os.getenv("ETL_MODULES", "sales_invoice,receivable_payment,sales_return")
+    module_names = os.getenv(
+        "ETL_MODULES",
+        "manual_journal,sales_invoice,receivable_payment,sales_return,purchase_invoice,payable_payment,purchase_return,cash_in,cash_out",
+    )
     requested = [m.strip() for m in module_names.split(",") if m.strip()]
     valid_modules = [m for m in requested if m in MODULE_TRANSFORMERS]
 
@@ -209,10 +327,9 @@ def _parse_modules_from_env() -> list[str]:
     return valid_modules
 
 
-def run_module_etl(source_engine, finance_session_factory, module_name: str, limit: int):
-    """Run ETL flow for one sales module."""
+def run_module_etl(finance_session_factory, module_name: str, source_records: list[dict]):
+    """Run ETL flow for one finance module from pre-extracted source records."""
     transform_func = MODULE_TRANSFORMERS[module_name]
-    source_records = extract_source_records(source_engine, module_name=module_name, limit=limit)
 
     if not source_records:
         log.info("%s: no source records found", module_name)
@@ -236,11 +353,12 @@ def run_module_etl(source_engine, finance_session_factory, module_name: str, lim
         session.commit()
 
     log.info(
-        "%s: success=%s failed=%s rows=%s",
+        "%s: success=%s failed=%s rows=%s deleted=%s",
         module_name,
         result.get("success_records", 0),
         result.get("failed_records", 0),
         result.get("processed_rows", 0),
+        result.get("deleted_documents", 0),
     )
 
     if result.get("failed_detail"):
@@ -255,12 +373,27 @@ def run_module_etl(source_engine, finance_session_factory, module_name: str, lim
 # ============================================================
 
 
-def run_pipeline():
-    """Run callback-based ETL for selected finance modules."""
+def run_pipeline(since=None, until=None, update_watermark=None):
+    """Run callback-based ETL for selected finance modules.
+
+    Modes:
+      * default (since=until=None): continuous incremental from the stored
+        watermark; advances the watermark on success.
+      * ad-hoc range (since and/or until given): process the created_at window
+        (since, until] regardless of the watermark, and by default DO NOT advance
+        it — so a period backfill never makes the daily run skip newer data.
+
+    `update_watermark` overrides the default (True/False) if you really want an
+    ad-hoc range to also move the watermark.
+    """
     modules = _parse_modules_from_env()
     if not modules:
         log.warning("No valid modules configured. Nothing to run.")
         return
+
+    ad_hoc = since is not None or until is not None
+    if update_watermark is None:
+        update_watermark = INCREMENTAL and not ad_hoc
 
     source_engine = get_source_engine()
     finance_engine = get_finance_engine()
@@ -274,19 +407,57 @@ def run_pipeline():
     total_failed = 0
     total_rows = 0
     module_summaries = []
+    new_watermark = None
 
     try:
+        # ---- Extract ----
+        if ad_hoc:
+            log.info("Ad-hoc range extract: since=%s until=%s (update_watermark=%s)", since, until, update_watermark)
+            buckets, new_watermark = extract_source_since(source_engine, since, modules, until=until)
+            log.info("Extracted range: %s callbacks matched across modules", sum(len(v) for v in buckets.values()))
+        elif INCREMENTAL:
+            watermark = get_watermark(finance_engine)
+            if watermark is not None:
+                since = watermark - timedelta(minutes=WATERMARK_OVERLAP_MINUTES)
+                log.info("Incremental extract since %s (watermark %s, overlap %sm)", since, watermark, WATERMARK_OVERLAP_MINUTES)
+            else:
+                since = _resolve_initial_since()
+                log.info("No watermark yet — first run initial window since %s", since)
+
+            buckets, new_watermark = extract_source_since(source_engine, since, modules)
+            log.info("Extracted delta: %s callbacks matched across modules", sum(len(v) for v in buckets.values()))
+        else:
+            log.info("Incremental disabled — legacy 'newest %s per module' extraction", LIMIT_PER_MODULE)
+            buckets = {
+                module_name: extract_source_records(source_engine, module_name=module_name, limit=LIMIT_PER_MODULE)
+                for module_name in modules
+            }
+
+        # ---- Transform + Load per module ----
         for module_name in modules:
             result = run_module_etl(
-                source_engine=source_engine,
                 finance_session_factory=finance_session_factory,
                 module_name=module_name,
-                limit=LIMIT_PER_MODULE,
+                source_records=buckets.get(module_name, []),
             )
             module_summaries.append((module_name, result))
             total_records += result.get("input_records", 0)
             total_failed += result.get("failed_records", 0)
             total_rows += result.get("processed_rows", 0)
+
+        # Enrich the unified ledger with reporting data from the chart of
+        # accounts (coa). Runs once after all modules are loaded so every gl row
+        # — including this run's fresh inserts — gets its reporting/coa_code.
+        enriched = enrich_gl_reporting_engine(finance_engine)
+        log.info("GL reporting enriched from coa: %s rows updated", enriched)
+
+        # Advance the watermark only after a fully successful run, to the max
+        # created_at actually seen (never to "now" — a callback could arrive
+        # mid-run with an earlier timestamp and must not be skipped). Ad-hoc
+        # range runs skip this by default so they don't disturb daily runs.
+        if update_watermark and new_watermark is not None:
+            set_watermark(finance_engine, new_watermark)
+            log.info("Watermark advanced to %s", new_watermark)
 
         for module_name, result in module_summaries:
             log.info(
@@ -314,5 +485,36 @@ def run_pipeline():
         finance_engine.dispose()
 
 
+def _parse_bound(value: str, end_of_day: bool = False):
+    """Parse a CLI date/datetime. Date-only `until` snaps to end of day."""
+    if value is None:
+        return None
+    dt = datetime.fromisoformat(value)
+    if end_of_day and len(value.strip()) == 10:  # "YYYY-MM-DD" with no time
+        dt = dt.replace(hour=23, minute=59, second=59)
+    return dt
+
+
 if __name__ == "__main__":
-    run_pipeline()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Finance callback ETL. No args = continuous incremental run.",
+    )
+    parser.add_argument("--since", help="Start of created_at window (YYYY-MM-DD or 'YYYY-MM-DD HH:MM:SS'), exclusive")
+    parser.add_argument("--until", help="End of created_at window (YYYY-MM-DD or datetime), inclusive")
+    parser.add_argument("--last-days", type=int, help="Shortcut: process the last N days (e.g. 30 for last month)")
+    parser.add_argument(
+        "--set-watermark",
+        action="store_true",
+        help="Also advance the watermark for an ad-hoc range run (off by default)",
+    )
+    args = parser.parse_args()
+
+    since = _parse_bound(args.since)
+    until = _parse_bound(args.until, end_of_day=True)
+    if args.last_days is not None:
+        since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=args.last_days)
+
+    update_watermark = True if args.set_watermark else None
+    run_pipeline(since=since, until=until, update_watermark=update_watermark)

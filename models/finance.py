@@ -139,3 +139,56 @@ class CashOut(FinanceBase, TransactionLineMixin):
     __table_args__ = (
         UniqueConstraint("source_id", "source_line_id", name="uq_cash_out_source_line"),
     )
+
+
+class EtlState(FinanceBase):
+    """Key-value store for ETL run state.
+
+    Holds the incremental extraction watermark: the max source `created_at`
+    already processed. Each run pulls only callbacks newer than this (minus a
+    small overlap), so new/edited/cancelled transactions are never left behind
+    while old, untouched history is not re-scanned every run.
+    """
+
+    __tablename__ = "etl_state"
+
+    state_key = Column(String(100), primary_key=True)
+    watermark = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+
+
+class GeneralLedger(FinanceBase, TransactionLineMixin):
+    """Unified general ledger — every module's line rows land here.
+
+    Each of the nine subledger tables is written as usual, and the same
+    transformed rows are also upserted here so the whole company posts to a
+    single ledger. Because `source_id`/`source_line_id` are only unique within a
+    module, the business key is scoped by `type` (the source endpoint, e.g.
+    "sales_invoices"). `ref_key` disambiguates payment allocations where one
+    payment line is split across several invoices/purchases (same source_line_id,
+    different reference document).
+    """
+
+    __tablename__ = "gl"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Module discriminator (loader key, e.g. "sales_invoice"). `type` above holds
+    # the source endpoint; `module` mirrors the ETL module name for reporting.
+    module = Column(String(50), nullable=False, index=True)
+
+    # Reference document key for payment allocations; "" when not applicable.
+    ref_key = Column(String(200), nullable=False, default="")
+
+    # Reporting enrichment joined from accounting.coa. gl account codes are a
+    # simplified form of the coa codes (dashes dropped, trailing zeros trimmed),
+    # so the join is done on a normalized key — see load/gl_reporting.py.
+    # `coa_code` is the matched original coa account_code (the reconciled
+    # reference); `reporting` is the coa statement group (e.g. "Balance Sheet").
+    coa_code = Column(String(50), nullable=True, index=True)
+    reporting = Column(String(50), nullable=True, index=True)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "type", "source_id", "source_line_id", "ref_key", name="uq_gl_type_source_line"
+        ),
+    )

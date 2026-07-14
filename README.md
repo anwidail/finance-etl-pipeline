@@ -305,3 +305,8 @@ This pipeline evolves from a simple ETL process into a **finance data platform**
 - transforms raw operational events into structured accounting data  
 - supports transaction lifecycle management (edit, cancel, reversal)  
 - enables scalable financial reporting automation  
+ 
+
+Check Status:	brew services list
+Start MySQL:	brew services start mysql
+Stop MySQL:	brew services stop mysql

@@ -7,21 +7,10 @@ from typing import Any, Dict, List, Optional
 from transforms.tax_master import resolve_tax_account
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-# Untuk sales return, akun line item pada payload diasumsikan akun pendapatan asli.
-# Karena ini return, maka akun tersebut didebit sebagai contra-revenue / reversal revenue.
-
-
-# ============================================================
-# HELPERS
-# ============================================================
-
 def to_decimal(value: Any, default: str = "0") -> Decimal:
     if value is None or value == "":
         return Decimal(default)
+
     try:
         return Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError):
@@ -45,11 +34,15 @@ def get_nested(d: Dict[str, Any], *keys: str, default=None):
     return current
 
 
+def get_contact_name(data: Dict[str, Any]) -> Optional[str]:
+    return (
+        get_nested(data, "vendor", "name")
+        or get_nested(data, "supplier", "name")
+        or get_nested(data, "contact", "name")
+    )
+
+
 def compute_realization(account_code: Optional[str], debit: Decimal, credit: Decimal) -> Decimal:
-    """
-    Default sign = debit - credit
-    For groups 2,3,4,8 => reversed sign
-    """
     try:
         first_digit = int(str(account_code)[0]) if account_code else None
     except (ValueError, TypeError, IndexError):
@@ -62,12 +55,6 @@ def compute_realization(account_code: Optional[str], debit: Decimal, credit: Dec
 
 
 def parse_json_body(raw_body: Any) -> Dict[str, Any]:
-    """
-    Parse source DB body:
-    - dict
-    - JSON string
-    - double-encoded JSON string
-    """
     if isinstance(raw_body, dict):
         return raw_body
 
@@ -105,21 +92,19 @@ def reconcile_rows(
 
     if abs(diff) > tolerance:
         raise ValueError(
-            f"unbalanced sales_return transform for source_id={source_id}: "
+            f"unbalanced purchase_invoice transform for source_id={source_id}: "
             f"total_debit={total_debit}, total_credit={total_credit}, diff={diff}"
         )
 
 
-# ============================================================
-# VALIDATION
-# ============================================================
-
-def validate_sales_return_payload(payload: Dict[str, Any]) -> None:
+def validate_purchase_invoice_payload(payload: Dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         raise TypeError("payload must be a dict")
 
     end_point = payload.get("end_point")
-    if end_point != "sales_returns":
+    # Production data uses the "purchases_invoices" spelling; older fixtures use
+    # "purchase_invoices". Accept both so extraction and tests stay in sync.
+    if end_point not in ("purchases_invoices", "purchase_invoices"):
         raise ValueError(f"unexpected end_point: {end_point}")
 
     data = payload.get("data")
@@ -130,7 +115,7 @@ def validate_sales_return_payload(payload: Dict[str, Any]) -> None:
         "data.id": data.get("id"),
         "data.number": data.get("number"),
         "data.date": data.get("date"),
-        "data.customer.name": get_nested(data, "customer", "name"),
+        "data.vendor.name": get_contact_name(data),
     }
 
     missing = [field for field, value in required_fields.items() if value in (None, "")]
@@ -138,24 +123,18 @@ def validate_sales_return_payload(payload: Dict[str, Any]) -> None:
         raise ValueError(f"missing required fields: {', '.join(missing)}")
 
 
-# ============================================================
-# NORMALIZATION
-# ============================================================
-
 def normalize_base_fields(data: Dict[str, Any]) -> Dict[str, Any]:
-    customer = data.get("customer") or {}
     department = data.get("department") or {}
     project = data.get("project") or {}
     currency = data.get("currency") or {}
     created = data.get("created") or {}
     created_user = created.get("user") or {}
-    parent_memo = data.get("parent_memo") or {}
 
     return {
         "date": data.get("date"),
-        "type": "sales_returns",
+        "type": "purchase_invoices",
         "ref_no": data.get("number"),
-        "contact": customer.get("name"),
+        "contact": get_contact_name(data),
         "description": data.get("description"),
         "department": department.get("name"),
         "project": project.get("name"),
@@ -165,144 +144,140 @@ def normalize_base_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         "exchange_rate": to_decimal(data.get("exchange_rate", 1)),
         "created_at": created.get("time"),
         "created_by": created_user.get("name"),
-        "sales_ref_no": parent_memo.get("number"),
-        "sales_date": parent_memo.get("date"),
-        "sales_id": parent_memo.get("id"),
     }
 
 
-# ============================================================
-# MAIN TRANSFORM
-# ============================================================
-
-def transform_sales_return_from_body(raw_body: Any) -> List[Dict[str, Any]]:
+def transform_purchase_invoice_from_body(raw_body: Any) -> List[Dict[str, Any]]:
     payload = parse_json_body(raw_body)
-    return transform_sales_return(payload)
+    return transform_purchase_invoice(payload)
 
 
-def transform_sales_return(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+def transform_purchase_invoice(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     Journal pattern:
-    1. Debit Sales Return / reversal revenue from line_items
-    2. Debit Output VAT reversal from taxes
-    3. Credit A/R from payments
+    1. Debit expense / inventory from line_items
+    2. Debit input tax from line_items[].taxes
+    3. Credit A/P from payments
     """
-    validate_sales_return_payload(payload)
+    validate_purchase_invoice_payload(payload)
 
     data = payload["data"]
     base = normalize_base_fields(data)
-
     rows: List[Dict[str, Any]] = []
 
-    # ============================================================
-    # 1) DEBIT SALES RETURN / REVERSAL REVENUE
-    # ============================================================
     for line in data.get("line_items", []) or []:
         dept = line.get("department") or data.get("department") or {}
         proj = line.get("project") or data.get("project") or {}
-        curr = data.get("currency") or {}
+        curr = line.get("currency") or data.get("currency") or {}
         acc = line.get("account") or {}
 
-        rate = to_decimal(data.get("exchange_rate", base["exchange_rate"]))
-
+        line_xr = to_decimal(line.get("exchange_rate", base["exchange_rate"]))
         line_base = {
             **base,
             "department": dept.get("name"),
             "project": proj.get("name"),
             "currency": curr.get("code") or base["currency"],
-            "exchange_rate": rate,
+            "exchange_rate": line_xr,
         }
 
-        # Line amounts (revenue, tax) are in the transaction currency, but the A/R
-        # payment below is already in base currency (IDR). Convert the line side by
-        # the exchange rate so both sides are in IDR and the entry balances. For
-        # IDR documents rate == 1, so this is a no-op.
-        revenue_reversal = to_decimal(
+        # Line-item amounts are in the transaction (origin) currency, while the
+        # payment side below uses the base-currency `amount`. Convert the debit
+        # side to base currency so the journal balances. For base-currency
+        # invoices the exchange rate is 1, leaving the value unchanged.
+        purchase_amount = to_decimal(
             line.get("subtotal_after_discount")
             if line.get("subtotal_after_discount") is not None
             else line.get("subtotal_before_discount")
-        ) * rate
-
+        ) * line_xr
         account_code = to_str(acc.get("code"))
 
-        if revenue_reversal != 0:
+        if purchase_amount != 0:
             rows.append({
                 **line_base,
-                "note": line.get("description") or "Sales Return",
-                "debit": revenue_reversal,
+                "note": line.get("description") or "Purchase",
+                "debit": purchase_amount,
                 "credit": Decimal("0"),
-                "realization": compute_realization(account_code, revenue_reversal, Decimal("0")),
+                "realization": compute_realization(account_code, purchase_amount, Decimal("0")),
                 "account_code": account_code,
                 "coa_name": acc.get("name"),
-                # Suffix the role so a revenue line never shares a source_line_id
-                # with an A/R payment line that reuses the same Zahir id (which
-                # would collide on the (source_id, source_line_id) key at load and
-                # silently drop one side, unbalancing the entry).
-                "source_line_id": f"{to_str(line.get('id'))}_rev",
+                "source_line_id": to_str(line.get("id")),
             })
 
-        # ========================================================
-        # 2) DEBIT TAX REVERSAL
-        # ========================================================
         for tax in line.get("taxes", []) or []:
-            tax_amount = to_decimal(tax.get("amount")) * rate
+            tax_amount = to_decimal(tax.get("amount")) * line_xr
             if tax_amount == 0:
                 continue
 
-            tax_code, tax_coa_name = resolve_tax_account(tax, "sales")
+            tax_code, tax_coa_name = resolve_tax_account(tax, "purchase")
 
             rows.append({
                 **line_base,
-                "note": tax.get("name") or tax.get("code") or "Tax Reversal",
+                "note": tax.get("name") or tax.get("code") or "Input Tax",
                 "debit": tax_amount,
                 "credit": Decimal("0"),
                 "realization": compute_realization(tax_code, tax_amount, Decimal("0")),
                 "account_code": tax_code,
                 "coa_name": tax_coa_name,
-                # Include the parent line id: Zahir reuses one tax id across
-                # several lines, so a tax-only suffix would collide and drop rows.
+                # tax.id is the tax-type id (e.g. shared "PPN 11%"), so it repeats
+                # across line items. Prefix with the line id to keep the upsert key
+                # (source_id, source_line_id) unique within an invoice.
                 "source_line_id": f"{to_str(line.get('id'))}_{to_str(tax.get('id'))}_tax",
             })
 
-    # ============================================================
-    # 3) CREDIT A/R
-    # ============================================================
-    for pay in data.get("payments", []) or []:
-        acc = pay.get("account") or {}
-        payment_amount = to_decimal(pay.get("amount"))
+    # Other charges (freight, stamp duty, purchase VAT, etc.) are carried in the
+    # `others` array and are included in the payable total, so they need their own
+    # debit row. The `amount` field is already in base currency, like payments.
+    for other in data.get("others", []) or []:
+        acc = other.get("account") or {}
+        other_amount = to_decimal(other.get("amount"))
         account_code = to_str(acc.get("code"))
 
-        if payment_amount == 0:
+        if other_amount == 0:
             continue
 
         rows.append({
             **base,
-            "note": "Accounts Receivable Reversal",
-            "debit": Decimal("0"),
-            "credit": payment_amount,
-            "realization": compute_realization(account_code, Decimal("0"), payment_amount),
+            "note": acc.get("name") or "Other Charge",
+            "debit": other_amount,
+            "credit": Decimal("0"),
+            "realization": compute_realization(account_code, other_amount, Decimal("0")),
             "account_code": account_code,
             "coa_name": acc.get("name"),
-            # Distinct role suffix (see revenue line) to avoid a source_line_id
-            # collision with the reversal-revenue line.
-            "source_line_id": f"{to_str(pay.get('id'))}_ar",
+            "source_line_id": f"{to_str(other.get('id'))}_other",
+            "currency": get_nested(other, "currency", "code", default=base["currency"]) or base["currency"],
+            "exchange_rate": to_decimal(other.get("exchange_rate", base["exchange_rate"])),
+        })
+
+    for pay in data.get("payments", []) or []:
+        acc = pay.get("account") or {}
+        payable_amount = to_decimal(pay.get("amount"))
+        account_code = to_str(acc.get("code"))
+
+        if payable_amount == 0:
+            continue
+
+        rows.append({
+            **base,
+            "note": "Accounts Payable",
+            "debit": Decimal("0"),
+            "credit": payable_amount,
+            "realization": compute_realization(account_code, Decimal("0"), payable_amount),
+            "account_code": account_code,
+            "coa_name": acc.get("name"),
+            "source_line_id": to_str(pay.get("id")),
             "currency": get_nested(pay, "currency", "code", default=base["currency"]) or base["currency"],
             "exchange_rate": to_decimal(pay.get("exchange_rate", base["exchange_rate"])),
         })
 
     if not rows:
-        raise ValueError(f"no rows generated for sales_return source_id={data.get('id')}")
+        raise ValueError(f"no rows generated for purchase_invoice source_id={data.get('id')}")
 
     reconcile_rows(rows, source_id=str(data["id"]))
     return rows
 
 
-# ============================================================
-# OPTIONAL WRAPPER FOR SOURCE RECORD
-# ============================================================
-
-def transform_sales_return_source_record(source_record: Dict[str, Any]) -> List[Dict[str, Any]]:
-    rows = transform_sales_return_from_body(source_record["body"])
+def transform_purchase_invoice_source_record(source_record: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = transform_purchase_invoice_from_body(source_record["body"])
 
     for row in rows:
         row["raw_callback_id"] = to_str(source_record.get("callback_id"))
