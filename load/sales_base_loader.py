@@ -241,27 +241,42 @@ def process_source_records(
     rows (and skips re-inserting them); POST/edit callbacks are transformed and
     upserted as usual.
     """
-    # Resolve the latest callback method per document (by created_at). A DELETE
-    # that supersedes earlier POST/edit callbacks means the document must be
-    # removed. Matching is on source_id (UUID), not the voucher number.
-    latest_method: Dict[Any, Any] = {}
+    # Resolve the latest callback state per document (by created_at): its HTTP
+    # method and status. A DELETE that supersedes earlier POST/edit callbacks
+    # means the document must be removed; a document whose latest status is not
+    # "approved" (e.g. draft) must likewise be kept out of the ledger. Matching
+    # is on source_id (UUID), not the voucher number.
+    latest_state: Dict[Any, Any] = {}
     for rec in source_records:
         sid = rec.get("source_id")
         if not sid:
             continue
         ts = rec.get("created_at")
         method = (rec.get("method") or "POST").upper()
-        if sid not in latest_method or _is_newer(ts, latest_method[sid][0]):
-            latest_method[sid] = (ts, method)
-    delete_source_ids = {sid for sid, (ts, method) in latest_method.items() if method == "DELETE"}
+        status = rec.get("status")
+        if sid not in latest_state or _is_newer(ts, latest_state[sid][0]):
+            latest_state[sid] = (ts, method, status)
+
+    delete_source_ids = {sid for sid, (ts, method, status) in latest_state.items() if method == "DELETE"}
+    # Only approved documents post to the ledger. A non-approved latest state
+    # (draft) is removed like a delete so a document reverted to draft does not
+    # linger. Status is absent only for synthetic/legacy records — default those
+    # to approved so real data is never silently dropped.
+    non_approved_source_ids = {
+        sid
+        for sid, (ts, method, status) in latest_state.items()
+        if method != "DELETE" and str(status if status is not None else "approved").lower() != "approved"
+    }
+    # Skip transforming/loading either set; remove both from the ledger below.
+    skip_source_ids = delete_source_ids | non_approved_source_ids
 
     all_rows: List[Dict[str, Any]] = []
     failed_records: List[Dict[str, Any]] = []
 
     for rec in source_records:
-        # Documents whose latest state is DELETE must not be re-inserted; their
-        # existing rows are removed after the load step below.
-        if rec.get("source_id") in delete_source_ids:
+        # Documents whose latest state is DELETE or non-approved must not be
+        # re-inserted; their existing rows are removed after the load step below.
+        if rec.get("source_id") in skip_source_ids:
             continue
         try:
             transformed_rows = transform_func(rec)
@@ -281,6 +296,7 @@ def process_source_records(
         "processed_rows": 0,
         "chunks": 0,
         "deleted_documents": 0,
+        "skipped_non_approved": len(non_approved_source_ids),
     }
 
     # A single extract can contain several callbacks for the same document (the
@@ -325,12 +341,13 @@ def process_source_records(
             )
             result["gl_processed_rows"] = gl_result.get("processed_rows", 0)
 
-    # Apply DELETE callbacks last so a delete always wins over any stale rows.
-    if delete_source_ids:
+    # Remove deleted AND non-approved (draft) documents last so removal always
+    # wins over any stale rows a prior approved version may have left behind.
+    if skip_source_ids:
         result["deleted_documents"] = delete_documents_by_source_id(
             session=session,
             model=model,
-            source_ids=delete_source_ids,
+            source_ids=skip_source_ids,
             gl_module_name=gl_module_name,
         )
 

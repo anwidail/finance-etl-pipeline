@@ -185,7 +185,9 @@ def extract_source_records(source_engine, module_name: str, limit: int) -> list[
             continue
 
         if payload.get("end_point") == endpoint:
-            rec["source_id"] = (payload.get("data") or {}).get("id")
+            data = payload.get("data") or {}
+            rec["source_id"] = data.get("id")
+            rec["status"] = data.get("status")
             records.append(rec)
 
         if len(records) >= limit:
@@ -252,9 +254,12 @@ def extract_source_since(source_engine, since, modules: list[str], until=None):
 
         module = ENDPOINT_TO_MODULE.get(payload.get("end_point"))
         if module in buckets:
-            # Attach the document id (data.id UUID) and HTTP method so the loader
-            # can apply DELETE / edit semantics keyed strictly on source_id.
-            rec["source_id"] = (payload.get("data") or {}).get("id")
+            # Attach the document id (data.id UUID), status and HTTP method so the
+            # loader can apply DELETE / draft / edit semantics keyed strictly on
+            # source_id.
+            data = payload.get("data") or {}
+            rec["source_id"] = data.get("id")
+            rec["status"] = data.get("status")
             buckets[module].append(rec)
 
     return buckets, max_created_at
