@@ -188,6 +188,10 @@ def extract_source_records(source_engine, module_name: str, limit: int) -> list[
             data = payload.get("data") or {}
             rec["source_id"] = data.get("id")
             rec["status"] = data.get("status")
+            # The action lives in the body's `method` (POST/PUT/PATCH/DELETE); the
+            # DB `method` column is only the HTTP verb of the callback delivery
+            # (always POST) and never carries DELETE, so it cannot be used here.
+            rec["method"] = payload.get("method")
             records.append(rec)
 
         if len(records) >= limit:
@@ -254,12 +258,15 @@ def extract_source_since(source_engine, since, modules: list[str], until=None):
 
         module = ENDPOINT_TO_MODULE.get(payload.get("end_point"))
         if module in buckets:
-            # Attach the document id (data.id UUID), status and HTTP method so the
+            # Attach the document id (data.id UUID), status and action so the
             # loader can apply DELETE / draft / edit semantics keyed strictly on
-            # source_id.
+            # source_id. The action is the body's `method` (POST/PUT/PATCH/DELETE);
+            # the DB `method` column is only the callback's HTTP verb (always POST)
+            # and never carries DELETE, so it cannot be used to detect deletions.
             data = payload.get("data") or {}
             rec["source_id"] = data.get("id")
             rec["status"] = data.get("status")
+            rec["method"] = payload.get("method")
             buckets[module].append(rec)
 
     return buckets, max_created_at
