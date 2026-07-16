@@ -165,6 +165,7 @@ def normalize_base_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         "status": data.get("status"),
         "currency": currency.get("code") or "IDR",
         "exchange_rate": to_decimal(data.get("exchange_rate", 1)),
+        "original_currency": ((data.get("cash") or {}).get("currency") or {}).get("code") or (data.get("currency") or {}).get("code") or "IDR",
         "created_at": to_wib(created.get("time")),
         "created_by": created_user.get("name"),
         "sales_ref_no": parent_memo.get("number"),
@@ -240,7 +241,7 @@ def transform_sales_return(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "note": line.get("description") or "Sales Return",
                 "debit": revenue_reversal,
                 "credit": Decimal("0"),
-                "realization": compute_realization(account_code, revenue_reversal, Decimal("0")),
+                "amount": compute_realization(account_code, revenue_reversal, Decimal("0")),
                 "account_code": account_code,
                 "coa_name": acc.get("name"),
                 # Suffix the role so a revenue line never shares a source_line_id
@@ -257,7 +258,7 @@ def transform_sales_return(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "note": "Discount",
                 "debit": Decimal("0"),
                 "credit": discount_amount,
-                "realization": compute_realization(disc_code, Decimal("0"), discount_amount),
+                "amount": compute_realization(disc_code, Decimal("0"), discount_amount),
                 "account_code": disc_code,
                 "coa_name": disc_coa_name,
                 "source_line_id": f"{to_str(line.get('id'))}_disc",
@@ -278,7 +279,7 @@ def transform_sales_return(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "note": tax.get("name") or tax.get("code") or "Tax Reversal",
                 "debit": tax_amount,
                 "credit": Decimal("0"),
-                "realization": compute_realization(tax_code, tax_amount, Decimal("0")),
+                "amount": compute_realization(tax_code, tax_amount, Decimal("0")),
                 "account_code": tax_code,
                 "coa_name": tax_coa_name,
                 # Include the parent line id: Zahir reuses one tax id across
@@ -302,7 +303,7 @@ def transform_sales_return(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "note": "Accounts Receivable Reversal",
             "debit": Decimal("0"),
             "credit": payment_amount,
-            "realization": compute_realization(account_code, Decimal("0"), payment_amount),
+            "amount": compute_realization(account_code, Decimal("0"), payment_amount),
             "account_code": account_code,
             "coa_name": acc.get("name"),
             # Distinct role suffix (see revenue line) to avoid a source_line_id

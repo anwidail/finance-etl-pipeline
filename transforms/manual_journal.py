@@ -134,6 +134,7 @@ def normalize_base_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         "status": data.get("status"),
         "currency": "IDR",
         "exchange_rate": Decimal("1"),
+        "original_currency": ((data.get("cash") or {}).get("currency") or {}).get("code") or (data.get("currency") or {}).get("code") or "IDR",
         "created_at": to_wib(created.get("time")),
         "created_by": created_user.get("name"),
     }
@@ -180,7 +181,7 @@ def transform_manual_journal(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "note": acc.get("name") or "Manual Journal",
             "debit": debit,
             "credit": credit,
-            "realization": compute_realization(account_code, debit, credit),
+            "amount": compute_realization(account_code, debit, credit),
             "account_code": account_code,
             "coa_name": acc.get("name"),
             "source_line_id": to_str(line.get("id")),

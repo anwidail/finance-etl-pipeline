@@ -32,7 +32,7 @@ class TransactionLineMixin:
 
     debit = Column(Numeric(18, 2), nullable=False, default=0)
     credit = Column(Numeric(18, 2), nullable=False, default=0)
-    realization = Column(Numeric(18, 2), nullable=False, default=0)
+    amount = Column(Numeric(18, 2), nullable=False, default=0)
 
     account_code = Column(String(50), nullable=True, index=True)
     coa_name = Column(String(200), nullable=True)
@@ -40,7 +40,10 @@ class TransactionLineMixin:
     source_id = Column(String(100), nullable=False, index=True)
     source_line_id = Column(String(100), nullable=True, index=True)
 
+    # `currency` is the line/booking currency; `original_currency` is the source
+    # transaction currency (the foreign currency for FX documents, else IDR).
     currency = Column(String(10), nullable=True, default="IDR")
+    original_currency = Column(String(10), nullable=True)
     exchange_rate = Column(Numeric(18, 6), nullable=True, default=1)
 
     status = Column(String(50), nullable=True, index=True)
