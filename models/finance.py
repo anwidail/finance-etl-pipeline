@@ -40,10 +40,11 @@ class TransactionLineMixin:
     source_id = Column(String(100), nullable=False, index=True)
     source_line_id = Column(String(100), nullable=True, index=True)
 
-    # `currency` is the line/booking currency; `original_currency` is the source
-    # transaction currency (the foreign currency for FX documents, else IDR).
+    # `currency` is the line/booking currency (its code); `original_currency`
+    # holds the row `amount` expressed in that original currency (amount /
+    # exchange_rate — the foreign-currency value for FX documents, else = amount).
     currency = Column(String(10), nullable=True, default="IDR")
-    original_currency = Column(String(10), nullable=True)
+    original_currency = Column(Numeric(18, 2), nullable=True)
     exchange_rate = Column(Numeric(18, 6), nullable=True, default=1)
 
     status = Column(String(50), nullable=True, index=True)

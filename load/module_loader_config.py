@@ -53,6 +53,7 @@ DECIMAL_COLUMNS = [
     "debit",
     "credit",
     "amount",
+    "original_currency",
     "exchange_rate",
 ]
 

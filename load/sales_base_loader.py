@@ -1,11 +1,35 @@
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, Iterable, List
 
 from sqlalchemy import delete, tuple_
 from sqlalchemy.dialects.mysql import insert
 from sqlalchemy.orm import Session
+
+
+def _to_decimal(value: Any) -> Decimal:
+    if value is None or value == "":
+        return Decimal("0")
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        return Decimal("0")
+
+
+def amount_in_original_currency(amount: Any, exchange_rate: Any) -> Decimal:
+    """The row `amount` expressed in its original (transaction) currency.
+
+    amount is stored in the booking currency (IDR); dividing by the row exchange
+    rate recovers the original-currency value (source amount = amount_origin *
+    rate, so amount / rate == amount_origin). A rate of 0/None means no
+    conversion (the amount is already in its original currency).
+    """
+    amt = _to_decimal(amount)
+    rate = _to_decimal(exchange_rate)
+    if rate == 0:
+        return amt.quantize(Decimal("0.01"))
+    return (amt / rate).quantize(Decimal("0.01"))
 
 
 def _is_newer(ts, current) -> bool:
@@ -280,6 +304,11 @@ def process_source_records(
             continue
         try:
             transformed_rows = transform_func(rec)
+            for row in transformed_rows:
+                # amount restated in the row's original transaction currency.
+                row["original_currency"] = amount_in_original_currency(
+                    row.get("amount"), row.get("exchange_rate")
+                )
             all_rows.extend(transformed_rows)
         except Exception as e:
             failed_records.append({

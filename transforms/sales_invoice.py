@@ -148,7 +148,6 @@ def normalize_base_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         "status": data.get("status"),
         "currency": currency.get("code") or "IDR",
         "exchange_rate": to_decimal(data.get("exchange_rate", 1)),
-        "original_currency": ((data.get("cash") or {}).get("currency") or {}).get("code") or (data.get("currency") or {}).get("code") or "IDR",
         "created_at": to_wib(created.get("time")),
         "created_by": created_user.get("name"),
     }
