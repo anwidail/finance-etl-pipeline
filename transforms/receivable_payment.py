@@ -4,6 +4,12 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
+from transforms.forex import (
+    BANK_CHARGE_CODE,
+    BANK_CHARGE_NAME,
+    forex_account,
+    is_fx_settlement,
+)
 from transforms.tax_master import resolve_discount_account
 
 
@@ -21,12 +27,11 @@ DEFAULT_CASH_ACCOUNT = {
     "coa_name": "Cash/Bank Clearing",
 }
 
-# Bank admin fee the bank deducts from a receipt (not always recorded in the
-# payload), so cash received < amount settled. coa 6924-00-000 -> gl code 6924.
-BANK_CHARGE_ACCOUNT_CODE = "6924"
-BANK_CHARGE_ACCOUNT_NAME = "Bank Administrative"
-# Only auto-post the residual as a bank charge up to this size; a larger gap is a
-# real discrepancy that must surface as an error instead of being masked.
+# Bank admin fee the bank deducts from a receipt (6924, see transforms.forex).
+# Only auto-post the balancing residual up to this size; a larger gap is a real
+# discrepancy that must surface as an error instead of being masked.
+BANK_CHARGE_ACCOUNT_CODE = BANK_CHARGE_CODE
+BANK_CHARGE_ACCOUNT_NAME = BANK_CHARGE_NAME
 BANK_CHARGE_MAX_ABS = Decimal("50000")
 
 
@@ -267,6 +272,10 @@ def transform_receivable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]
     cash = data.get("cash", {}) or {}
     cash_acc = cash.get("account", {}) or {}
 
+    # Foreign-currency settlement: the exchange difference is a realized forex
+    # gain/loss rather than a bank charge, so reclassify it below.
+    fx = is_fx_settlement(cash)
+
     cash_amount = to_decimal(cash.get("amount"))
     cash_code = to_str(cash_acc.get("code"))
     cash_name = cash_acc.get("name") or DEFAULT_CASH_ACCOUNT["coa_name"]
@@ -309,6 +318,12 @@ def transform_receivable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]
             debit = Decimal("0")
             credit = other_amount
             note = "Other Adjustment"
+
+        # On an FX settlement, an exchange difference the source carries on the
+        # Bank Administrative account is really a realized forex gain/loss.
+        if fx and other_code == BANK_CHARGE_CODE:
+            other_code, other_name = forex_account(is_debit=debit > 0)
+            note = other_name
 
         rows.append({
             **base,
@@ -418,25 +433,30 @@ def transform_receivable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]
     if not rows:
         raise ValueError(f"no rows generated for receivable_payment source_id={data.get('id')}")
 
-    # Post any small unrecorded bank admin fee: the payment settled the invoices,
-    # but the bank deducted a fee so cash received < amount settled. The residual
-    # is that fee — debit it to Bank Administrative so the entry balances. Capped
-    # so a large discrepancy still surfaces as an error for review.
+    # Absorb the small balancing residual: on an FX settlement it is a realized
+    # forex gain/loss, otherwise an unrecorded bank admin fee (cash received <
+    # amount settled). Capped so a large discrepancy still surfaces as an error.
     total_debit = sum((to_decimal(r.get("debit")) for r in rows), Decimal("0"))
     total_credit = sum((to_decimal(r.get("credit")) for r in rows), Decimal("0"))
     residual = total_credit - total_debit
     if residual != 0 and abs(residual) <= BANK_CHARGE_MAX_ABS:
         debit = residual if residual > 0 else Decimal("0")
         credit = -residual if residual < 0 else Decimal("0")
+        if fx:
+            code, name = forex_account(is_debit=debit > 0)
+            source_line_id = "forex_diff"
+        else:
+            code, name = BANK_CHARGE_ACCOUNT_CODE, BANK_CHARGE_ACCOUNT_NAME
+            source_line_id = "bank_charge"
         rows.append({
             **base,
-            "note": BANK_CHARGE_ACCOUNT_NAME,
+            "note": name,
             "debit": debit,
             "credit": credit,
-            "realization": compute_realization(BANK_CHARGE_ACCOUNT_CODE, debit, credit),
-            "account_code": BANK_CHARGE_ACCOUNT_CODE,
-            "coa_name": BANK_CHARGE_ACCOUNT_NAME,
-            "source_line_id": "bank_charge",
+            "realization": compute_realization(code, debit, credit),
+            "account_code": code,
+            "coa_name": name,
+            "source_line_id": source_line_id,
         })
 
     reconcile_rows(rows, source_id=str(data["id"]))

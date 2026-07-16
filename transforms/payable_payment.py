@@ -4,6 +4,12 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
+from transforms.forex import (
+    BANK_CHARGE_CODE,
+    BANK_CHARGE_NAME,
+    forex_account,
+    is_fx_settlement,
+)
 from transforms.tax_master import resolve_discount_account
 
 
@@ -12,13 +18,9 @@ from transforms.tax_master import resolve_discount_account
 WHT_ACCOUNT_CODE = "212423"
 WHT_ACCOUNT_NAME = "W/H TA 23 (Supplier/Vendor)"
 
-# Foreign-currency settlements leave a tiny sub-unit residual from Zahir's own
-# rate conversion. Post it as a realized forex gain/loss so the entry balances
-# exactly (coa 8104 / 9104). Capped so a large discrepancy still fails for review.
-FOREX_GAIN_ACCOUNT_CODE = "8104"
-FOREX_GAIN_ACCOUNT_NAME = "Realize Forex Gain"
-FOREX_LOSS_ACCOUNT_CODE = "9104"
-FOREX_LOSS_ACCOUNT_NAME = "Realize Forex Loss"
+# Foreign-currency settlements leave an exchange difference posted as a realized
+# forex gain/loss (8104 / 9104, see transforms.forex). Capped so a large
+# discrepancy still fails for review; non-FX residuals stay a bank charge.
 FOREX_ROUNDING_MAX_ABS = Decimal("50000")
 
 DEFAULT_CASH_ACCOUNT = {
@@ -220,6 +222,10 @@ def transform_payable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     cash = data.get("cash", {}) or {}
     cash_acc = cash.get("account", {}) or {}
 
+    # Foreign-currency settlement: the exchange difference is a realized forex
+    # gain/loss rather than a bank charge, so reclassify it below.
+    fx = is_fx_settlement(cash)
+
     cash_amount = to_decimal(cash.get("amount"))
     cash_code = to_str(cash_acc.get("code"))
     cash_name = cash_acc.get("name") or DEFAULT_CASH_ACCOUNT["coa_name"]
@@ -257,6 +263,12 @@ def transform_payable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             debit = other_amount
             credit = Decimal("0")
             note = "Other Charge"
+
+        # On an FX settlement, an exchange difference the source carries on the
+        # Bank Administrative account is really a realized forex gain/loss.
+        if fx and other_code == BANK_CHARGE_CODE:
+            other_code, other_name = forex_account(is_debit=debit > 0)
+            note = other_name
 
         rows.append({
             **base,
@@ -363,17 +375,22 @@ def transform_payable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not rows:
         raise ValueError(f"no rows generated for payable_payment source_id={data.get('id')}")
 
-    # Absorb small FX rounding: post the residual to realized forex gain/loss so
-    # the entry balances exactly. Capped so a large gap still surfaces as an error.
+    # Absorb the small balancing residual: on an FX settlement it is a realized
+    # forex gain/loss, otherwise a bank charge. Capped so a large gap still
+    # surfaces as an error for review.
     total_debit = sum((to_decimal(r.get("debit")) for r in rows), Decimal("0"))
     total_credit = sum((to_decimal(r.get("credit")) for r in rows), Decimal("0"))
     residual = total_debit - total_credit
     if residual != 0 and abs(residual) <= FOREX_ROUNDING_MAX_ABS:
-        if residual > 0:
-            # more debit than credit -> add a credit: realized forex gain
-            code, name, debit, credit = FOREX_GAIN_ACCOUNT_CODE, FOREX_GAIN_ACCOUNT_NAME, Decimal("0"), residual
+        # residual > 0 -> add a credit (forex gain); < 0 -> add a debit (loss).
+        debit = -residual if residual < 0 else Decimal("0")
+        credit = residual if residual > 0 else Decimal("0")
+        if fx:
+            code, name = forex_account(is_debit=debit > 0)
+            source_line_id = "forex_diff"
         else:
-            code, name, debit, credit = FOREX_LOSS_ACCOUNT_CODE, FOREX_LOSS_ACCOUNT_NAME, -residual, Decimal("0")
+            code, name = BANK_CHARGE_CODE, BANK_CHARGE_NAME
+            source_line_id = "bank_charge"
         rows.append({
             **base,
             "note": name,
@@ -382,7 +399,7 @@ def transform_payable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "realization": compute_realization(code, debit, credit),
             "account_code": code,
             "coa_name": name,
-            "source_line_id": "forex_rounding",
+            "source_line_id": source_line_id,
         })
 
     reconcile_rows(rows, source_id=str(data["id"]))
