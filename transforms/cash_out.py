@@ -4,6 +4,8 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
+from transforms.timeutil import to_wib
+
 
 DEFAULT_CASH_ACCOUNT = {
     "account_code": "111999",
@@ -132,7 +134,7 @@ def normalize_base_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         "project": project.get("name"),
         "source_id": data.get("id"),
         "status": data.get("status"),
-        "created_at": created.get("time"),
+        "created_at": to_wib(created.get("time")),
         "created_by": created_user.get("name"),
     }
 

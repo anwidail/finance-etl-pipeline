@@ -4,6 +4,8 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
+from transforms.timeutil import to_wib
+
 from transforms.tax_master import resolve_discount_account, resolve_tax_account
 
 
@@ -146,7 +148,7 @@ def normalize_base_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         "status": data.get("status"),
         "currency": currency.get("code") or "IDR",
         "exchange_rate": to_decimal(data.get("exchange_rate", 1)),
-        "created_at": created.get("time"),
+        "created_at": to_wib(created.get("time")),
         "created_by": created_user.get("name"),
     }
 
