@@ -161,6 +161,47 @@ class EtlState(FinanceBase):
     updated_at = Column(DateTime, nullable=True)
 
 
+class ActivityLog(FinanceBase):
+    """User activity / audit trail — one row per source callback (action).
+
+    Every finance-module callback is recorded as an activity: who performed what
+    action (create / update / delete) on which document, and when. This is
+    independent of the ledger load (which keeps only approved, latest,
+    non-deleted rows), so drafts, edits and deletes all appear here. Keyed on
+    `callback_id` for idempotent upserts across re-runs and backfills.
+
+    `created_date` / `created_by` describe the action itself (the actor and time
+    of this callback's change — `updated`, falling back to `created`), not
+    necessarily the document's original creation.
+    """
+
+    __tablename__ = "activity_log"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    created_date = Column(DateTime, nullable=True, index=True)
+    created_by = Column(String(200), nullable=True, index=True)
+    created_by_email = Column(String(200), nullable=True)
+
+    activity_type = Column(String(20), nullable=True, index=True)  # create/update/delete
+    action = Column(String(20), nullable=True)  # POST/PUT/PATCH/DELETE
+
+    module = Column(String(50), nullable=True, index=True)
+    endpoint = Column(String(50), nullable=True)
+
+    ref_no = Column(String(100), nullable=True, index=True)
+    source_id = Column(String(100), nullable=True, index=True)
+    status = Column(String(50), nullable=True, index=True)
+    doc_date = Column(Date, nullable=True, index=True)
+    note = Column(Text, nullable=True)
+
+    callback_id = Column(String(100), nullable=False)
+    callback_at = Column(DateTime, nullable=True, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("callback_id", name="uq_activity_log_callback"),
+    )
+
+
 class GeneralLedger(FinanceBase, TransactionLineMixin):
     """Unified general ledger — every module's line rows land here.
 

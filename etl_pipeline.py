@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from load.activity_log import build_activity_row, upsert_activity_rows
 from load.etl_state import get_watermark, set_watermark
 from load.gl_reporting import enrich_gl_reporting_engine
 from load.sales_module_loader import process_records_by_module
@@ -444,6 +445,23 @@ def run_pipeline(since=None, until=None, update_watermark=None):
                 module_name: extract_source_records(source_engine, module_name=module_name, limit=LIMIT_PER_MODULE)
                 for module_name in modules
             }
+
+        # ---- Activity log ----
+        # Record every extracted callback as a user activity (create/update/
+        # delete), independent of the ledger's approved-only / latest-only
+        # filtering. Idempotent on callback_id, so re-runs never duplicate.
+        activity_rows = []
+        for module_name, recs in buckets.items():
+            for rec in recs:
+                payload = parse_callback_body(rec.get("body"))
+                if not payload:
+                    continue
+                activity_rows.append(build_activity_row(rec, payload, module_name))
+        if activity_rows:
+            with finance_session_factory() as session:
+                logged = upsert_activity_rows(session, activity_rows, chunk_size=CHUNK_SIZE)
+                session.commit()
+            log.info("Activity log: %s activities upserted", logged)
 
         # ---- Transform + Load per module ----
         for module_name in modules:
