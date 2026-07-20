@@ -91,22 +91,33 @@ class DistributionRun(CostDistributionBase):
 # Editable monthly basis tables
 # ---------------------------------------------------------------------------
 # These mirror the workbook's reference sheets so the distribution basis can be
-# maintained per period (YYYY-MM) directly in MySQL — edited via SQL or a future
-# app — instead of editing Excel. Seed them with
+# maintained directly in MySQL — edited via SQL or a future app — instead of
+# editing Excel. Seed them with
 # ``load.cost_distribution_basis.import_basis_from_workbook`` and run the
-# pipeline with ``--basis-from-db --period YYYY-MM``. Every row carries a
-# ``period`` so each month has its own independently-editable basis version.
+# pipeline with ``--basis-from-db --period YYYY-MM``.
+#
+# Two kinds of basis:
+#   * Policy tables (PC, COA, LOGIC) — global, change only on a policy change,
+#     so they carry no ``period`` (one current version).
+#   * Monthly tables (ALLOCATION, FTE, REV) — the split factors and their
+#     headcount/revenue drivers change each month, so every row carries a
+#     ``period`` (YYYY-MM) and each month has its own editable version.
 
 
-class _BasisMixin:
+class _RefMixin:
+    """Shared columns for every basis table (no period)."""
     id = Column(Integer, primary_key=True, autoincrement=True)
-    period = Column(String(7), nullable=False, index=True)  # 'YYYY-MM'
     created_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, nullable=True)
 
 
-class BasisPC(CostDistributionBase, _BasisMixin):
-    """Cost-/profit-centre master (workbook sheet ``PC``)."""
+class _PeriodMixin(_RefMixin):
+    """Basis tables scoped to a month."""
+    period = Column(String(7), nullable=False, index=True)  # 'YYYY-MM'
+
+
+class BasisPC(CostDistributionBase, _RefMixin):
+    """Cost-/profit-centre master (workbook sheet ``PC``) — policy, no period."""
     __tablename__ = "basis_pc"
     dept_code = Column(String(50), nullable=True, index=True)
     dept = Column(String(200), nullable=True, index=True)
@@ -114,16 +125,16 @@ class BasisPC(CostDistributionBase, _BasisMixin):
     pc = Column(String(200), nullable=True, index=True)
 
 
-class BasisCOA(CostDistributionBase, _BasisMixin):
-    """Chart of accounts (workbook sheet ``COA``)."""
+class BasisCOA(CostDistributionBase, _RefMixin):
+    """Chart of accounts (workbook sheet ``COA``) — policy, no period."""
     __tablename__ = "basis_coa"
     code = Column(String(50), nullable=True, index=True)
     account_name = Column(String(200), nullable=True)
     reporting_line = Column(String(200), nullable=True)
 
 
-class BasisLogic(CostDistributionBase, _BasisMixin):
-    """Distribution rule table (workbook sheet ``LOGIC``).
+class BasisLogic(CostDistributionBase, _RefMixin):
+    """Distribution rule table (workbook sheet ``LOGIC``) — policy, no period.
 
     Rule key is (account_code, account_name, pc-bucket) -> distribution method.
     """
@@ -135,7 +146,7 @@ class BasisLogic(CostDistributionBase, _BasisMixin):
     code = Column(String(300), nullable=True)                    # descriptive id
 
 
-class BasisAllocation(CostDistributionBase, _BasisMixin):
+class BasisAllocation(CostDistributionBase, _PeriodMixin):
     """Split-factor table (workbook sheet ``ALLOCATION``).
 
     ``account_name`` is only populated for the ``Lab Distribution`` method.
@@ -149,7 +160,7 @@ class BasisAllocation(CostDistributionBase, _BasisMixin):
     percentage = Column(Numeric(30, 20), nullable=True)
 
 
-class BasisFTE(CostDistributionBase, _BasisMixin):
+class BasisFTE(CostDistributionBase, _PeriodMixin):
     """Headcount register (workbook sheet ``FTE``) — basis for FTE-* recompute."""
     __tablename__ = "basis_fte"
     fte = Column(Numeric(18, 6), nullable=True)
@@ -163,7 +174,7 @@ class BasisFTE(CostDistributionBase, _BasisMixin):
     location_detail = Column(String(200), nullable=True)
 
 
-class BasisREV(CostDistributionBase, _BasisMixin):
+class BasisREV(CostDistributionBase, _PeriodMixin):
     """Revenue basis (workbook sheet ``REV``) — basis for Revenue-* recompute."""
     __tablename__ = "basis_rev"
     div = Column(String(200), nullable=True, index=True)

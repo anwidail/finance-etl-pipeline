@@ -440,6 +440,9 @@ def main() -> None:
                              "tables for --period instead of the workbook")
     parser.add_argument("--import-basis", action="store_true",
                         help="seed the DB basis tables for --period from the workbook, then exit")
+    parser.add_argument("--reseed-global", action="store_true",
+                        help="with --import-basis, also refresh the global policy tables "
+                             "(PC/COA/LOGIC) from the workbook")
     parser.add_argument("--input", help="override input workbook path")
     parser.add_argument("--output", help="override output workbook path")
     args = parser.parse_args()
@@ -468,8 +471,10 @@ def main() -> None:
             parser.error("--import-basis requires --period YYYY-MM")
         from load.cost_distribution_basis import import_basis_from_workbook
         from load.cost_distribution_db import get_cost_engine
-        counts = import_basis_from_workbook(cfg, args.period, get_cost_engine())
-        logger.info("seeded basis for period %s: %s", args.period, counts)
+        counts = import_basis_from_workbook(cfg, args.period, get_cost_engine(),
+                                            refresh_global=args.reseed_global)
+        logger.info("seeded basis for period %s: %s (global refreshed=%s)",
+                    args.period, counts, args.reseed_global)
         return
 
     run(cfg, dry_run=args.dry_run, recompute_basis=args.recompute_basis,

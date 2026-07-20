@@ -25,6 +25,10 @@ from models.cost_distribution import (
     BasisPC, BasisCOA, BasisLogic, BasisAllocation, BasisFTE, BasisREV,
 )
 
+# Policy tables are global (no period, change only on a policy change); the rest
+# are month-scoped. Kept in sync with the mixins in models.cost_distribution.
+GLOBAL_SHEETS = {"PC", "COA", "LOGIC"}
+
 # Per table: ORM class + {orm_attr: workbook_sheet_column}. The sheet-column
 # names are what the pipeline (build_lookups / basis recompute) expects, so the
 # round-trip Excel -> DB -> DataFrame is lossless.
@@ -61,10 +65,15 @@ def _clean(value):
     return None if pd.isna(value) else value
 
 
-def import_basis_from_workbook(cfg, period: str, engine, chunk_size: int = 1000) -> Dict[str, int]:
-    """Seed the basis_* tables for ``period`` from the workbook. Returns row counts.
+def import_basis_from_workbook(cfg, period: str, engine, chunk_size: int = 1000,
+                               refresh_global: bool = False) -> Dict[str, int]:
+    """Seed the basis_* tables from the workbook. Returns row counts per sheet.
 
-    Replaces any existing rows for that period first (idempotent per month).
+    - Month-scoped tables (ALLOCATION, FTE, REV) always replace this ``period``'s
+      rows (idempotent per month).
+    - Policy tables (PC, COA, LOGIC) are global: seeded only when empty, so
+      re-importing another month never clobbers policy edits. Pass
+      ``refresh_global=True`` to force a full refresh from the workbook.
     """
     from load.cost_distribution_db import create_all
     create_all(engine)
@@ -76,13 +85,22 @@ def import_basis_from_workbook(cfg, period: str, engine, chunk_size: int = 1000)
 
     with Session() as session:
         for sheet, (model, colmap) in BASIS_TABLES.items():
-            df = xl.parse(sheet)
-            session.execute(delete(model).where(model.period == period))
+            is_global = sheet in GLOBAL_SHEETS
 
+            if is_global:
+                if session.query(model).count() and not refresh_global:
+                    counts[sheet] = 0  # left as-is (already seeded)
+                    continue
+                session.execute(delete(model))
+            else:
+                session.execute(delete(model).where(model.period == period))
+
+            df = xl.parse(sheet)
             records = []
             for _, row in df.iterrows():
                 rec = {orm: _clean(row[src]) for orm, src in colmap.items() if src in df.columns}
-                rec["period"] = period
+                if not is_global:
+                    rec["period"] = period
                 rec["created_at"] = now
                 rec["updated_at"] = now
                 records.append(rec)
@@ -103,10 +121,15 @@ def read_basis_from_db(period: str, engine) -> Dict[str, pd.DataFrame]:
 
     with Session() as session:
         for sheet, (model, colmap) in BASIS_TABLES.items():
-            rows = session.query(model).filter(model.period == period).all()
+            if sheet in GLOBAL_SHEETS:
+                rows = session.query(model).all()  # policy: single global version
+                where = "(global)"
+            else:
+                rows = session.query(model).filter(model.period == period).all()
+                where = f"period {period!r}"
             if not rows:
                 raise ValueError(
-                    f"No basis rows for sheet {sheet!r} at period {period!r}. "
+                    f"No basis rows for sheet {sheet!r} at {where}. "
                     f"Seed it first with import_basis_from_workbook / --import-basis."
                 )
             # Cast Decimal -> float so downstream pandas arithmetic (Amount *

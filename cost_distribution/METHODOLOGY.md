@@ -78,26 +78,34 @@ Every output row carries a `gl_line_id` internally so any allocated figure trace
 back to its source journal line. See `Automated_Cost_Distribution_Spec.md` for
 the full functional specification.
 
-## Editable monthly basis in MySQL
+## Editable basis in MySQL
 
-The reference basis (PC, COA, LOGIC, ALLOCATION, FTE, REV) can be maintained per
-month in `cost_distribution_db` instead of Excel, so it can be edited via SQL or
-a future app. Each row is tagged with a `period` (`YYYY-MM`), giving every month
-its own independently-editable basis version.
+The reference basis can be maintained in `cost_distribution_db` instead of Excel,
+so it can be edited via SQL or a future app. There are two kinds:
+
+| Kind | Tables | Period? | Changes |
+|---|---|---|---|
+| **Policy** | `basis_pc`, `basis_coa`, `basis_logic` | no | only on a policy change |
+| **Monthly** | `basis_allocation`, `basis_fte`, `basis_rev` | `period` (YYYY-MM) | each month |
+
+Policy tables hold a single current version; the monthly tables carry a `period`
+so every month has its own independently-editable split factors.
 
 ```bash
-# 1. seed a period's basis from the workbook (idempotent per period)
+# 1. seed: policy tables once (skipped if already present), the month's factors
 PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --import-basis --period 2026-04
+#    to also refresh the policy tables from the workbook, add --reseed-global
 
-# 2. edit the basis_* tables in MySQL as needed (basis_logic, basis_allocation, …)
+# 2. edit the basis_* tables in MySQL as needed
 
 # 3. run using the DB basis for that period (GL still from the workbook feed)
 PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline \
     --basis-from-db --period 2026-04 --to-db
 ```
 
-Tables: `basis_pc`, `basis_coa`, `basis_logic`, `basis_allocation`, `basis_fte`,
-`basis_rev`. Output rows and each `distribution_run` are tagged with the same
-`period`; a `--to-db` run replaces only that period's snapshot. Percentages are
-stored at `DECIMAL(30,20)` so FTE/Revenue shares still sum to exactly 1 and the
-allocation ties out to source. Schema is Alembic-managed under `alembic/cost/`.
+Re-importing another month never clobbers policy edits (policy tables are only
+seeded when empty, unless `--reseed-global`). Output rows and each
+`distribution_run` are tagged with the `period`; a `--to-db` run replaces only
+that period's snapshot. Percentages are stored `DECIMAL(30,20)` so FTE/Revenue
+shares still sum to exactly 1 and the allocation ties out. Schema is
+Alembic-managed under `alembic/cost/`.
