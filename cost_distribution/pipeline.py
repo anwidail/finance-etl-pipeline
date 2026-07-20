@@ -88,6 +88,8 @@ def extract(cfg: Config) -> Dict[str, pd.DataFrame]:
         "PC": read(cfg.sheet_pc),
         "LOGIC": read(cfg.sheet_logic),
         "ALLOCATION": read(cfg.sheet_allocation),
+        "FTE": read(cfg.sheet_fte),
+        "REV": read(cfg.sheet_rev),
     }
     logger.info("extracted: " + ", ".join(f"{k}={len(v)}" for k, v in sheets.items()))
     return sheets
@@ -385,8 +387,14 @@ def load(cfg: Config, out: pd.DataFrame, rejects: pd.DataFrame, recon: Recon) ->
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
-def run(cfg: Config, dry_run: bool = False):
+def run(cfg: Config, dry_run: bool = False, recompute_basis: bool = False,
+        to_db: bool = False):
     sheets = extract(cfg)
+    if recompute_basis:
+        from cost_distribution.basis import recompute_allocation, verify_against
+        refreshed = recompute_allocation(cfg, sheets["ALLOCATION"], sheets["FTE"], sheets["REV"])
+        verify_against(cfg, refreshed, sheets["ALLOCATION"])
+        sheets["ALLOCATION"] = refreshed
     lk = build_lookups(cfg, sheets)
     resolved = resolve_rule(sheets["GL"], lk)
     children, rejects = distribute(cfg, resolved, lk)
@@ -396,6 +404,10 @@ def run(cfg: Config, dry_run: bool = False):
         logger.info("dry-run: validation passed, nothing written")
     else:
         load(cfg, out, rejects, recon)
+        if to_db:
+            from load.cost_distribution_db import load_to_db
+            run_id = load_to_db(out, recon, cfg, recompute_basis=recompute_basis)
+            logger.info("loaded snapshot to cost_distribution_db (run_id=%s)", run_id)
     return out, rejects, recon
 
 
@@ -403,6 +415,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Automated Cost Distribution ETL")
     parser.add_argument("--dry-run", action="store_true",
                         help="run validation without writing output")
+    parser.add_argument("--recompute-basis", action="store_true",
+                        help="recompute FTE-*/Revenue-* factors from the FTE/REV sheets")
+    parser.add_argument("--to-db", action="store_true",
+                        help="also load the snapshot into cost_distribution_db (MySQL)")
     parser.add_argument("--input", help="override input workbook path")
     parser.add_argument("--output", help="override output workbook path")
     args = parser.parse_args()
@@ -412,13 +428,22 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
+    # Load .env so COST_DB_* (and any path overrides) are available for --to-db.
+    try:
+        from dotenv import load_dotenv
+        import os as _os
+        load_dotenv(_os.path.join(_os.path.dirname(__file__), "..", ".env"))
+    except ImportError:
+        pass
+
     cfg = load_config()
     if args.input:
         cfg = Config(input_path=args.input, output_path=cfg.output_path)
     if args.output:
         cfg = Config(input_path=cfg.input_path, output_path=args.output)
 
-    run(cfg, dry_run=args.dry_run)
+    run(cfg, dry_run=args.dry_run, recompute_basis=args.recompute_basis,
+        to_db=args.to_db)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,23 @@ class Config:
     # The one method whose split factors vary by account name (conditional join).
     lab_distribution_method: str = "Lab Distribution"
 
+    # Optional basis recompute (§1.6/§1.7). FTE-* factors are the headcount (HC)
+    # share by Dept within a Location scope; Revenue-* factors come from the REV
+    # sheet grouped by Div. `None` scope = all employees; otherwise the Location
+    # value must contain the given token (case-insensitive).
+    fte_scopes: Dict[str, str] = field(default_factory=lambda: {
+        "FTE - All": None,
+        "FTE - Head Office": "Head Office",
+        "FTE - Laboratory": "Laboratory",
+        "FTE - Surabaya": "Surabaya",
+        "FTE - Medan": "Medan",
+    })
+    rev_method_column: Dict[str, str] = field(default_factory=lambda: {
+        "Revenue HO": "Percentage HO",
+        "Revenue - Certification Services": "Percentage Certification Services",
+        "Revenue": "Percentage All",
+    })
+
     # --- Controls ---------------------------------------------------------
     tolerance: float = 1e-6
 
