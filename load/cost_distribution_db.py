@@ -70,7 +70,8 @@ def create_all(engine=None) -> None:
     CostDistributionBase.metadata.create_all(engine)
 
 
-def _rows_from_output(out: pd.DataFrame, run_id: int, loaded_at: datetime):
+def _rows_from_output(out: pd.DataFrame, run_id: int, loaded_at: datetime,
+                      period: str = None):
     """Yield ORM-ready dicts from the pipeline's output frame + helper columns."""
     df = out.copy()
     # Carry method + gl_line_id from the internal helper columns if present.
@@ -85,13 +86,14 @@ def _rows_from_output(out: pd.DataFrame, run_id: int, loaded_at: datetime):
         row["method"] = None if pd.isna(method.iloc[i]) else method.iloc[i]
         row["gl_line_id"] = None if pd.isna(gl_id.iloc[i]) else int(gl_id.iloc[i])
         row["run_id"] = run_id
+        row["period"] = period
         row["loaded_at"] = loaded_at
         records.append(row)
     return records
 
 
 def load_to_db(out: pd.DataFrame, recon, cfg, recompute_basis: bool = False,
-               engine=None, chunk_size: int = 1000) -> int:
+               engine=None, chunk_size: int = 1000, period: str = None) -> int:
     """Replace the distribution snapshot and record a reconciliation run.
 
     Returns the new ``distribution_run.id``. Everything happens in one
@@ -105,6 +107,7 @@ def load_to_db(out: pd.DataFrame, recon, cfg, recompute_basis: bool = False,
     with Session() as session:
         run = DistributionRun(
             run_at=now,
+            period=period,
             source_total=recon.source_total,
             allocated_total=recon.allocated_total,
             variance=recon.variance,
@@ -120,9 +123,13 @@ def load_to_db(out: pd.DataFrame, recon, cfg, recompute_basis: bool = False,
         session.flush()  # assign run.id
         run_id = run.id
 
-        # Idempotent snapshot: clear the table, then insert this run's rows.
-        session.execute(text("DELETE FROM distribution"))
-        records = _rows_from_output(out, run_id, now)
+        # Idempotent snapshot: clear this period's rows (or the whole table when
+        # no period is given), then insert this run's rows.
+        if period:
+            session.execute(text("DELETE FROM distribution WHERE period = :p"), {"p": period})
+        else:
+            session.execute(text("DELETE FROM distribution WHERE period IS NULL"))
+        records = _rows_from_output(out, run_id, now, period=period)
         for i in range(0, len(records), chunk_size):
             session.bulk_insert_mappings(Distribution, records[i:i + chunk_size])
 

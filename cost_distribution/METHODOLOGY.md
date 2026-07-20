@@ -68,9 +68,36 @@ PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --dry-run
 
 # full run → cost_distribution/output/Distribution_output.xlsx
 PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline
+
+# recompute FTE-*/Revenue-* factors from the FTE/REV sheets, and load to MySQL
+PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --recompute-basis --to-db
 ```
 
 Output workbook contains `Distribution`, `Reconciliation`, and (if any) `rejects`.
 Every output row carries a `gl_line_id` internally so any allocated figure traces
 back to its source journal line. See `Automated_Cost_Distribution_Spec.md` for
 the full functional specification.
+
+## Editable monthly basis in MySQL
+
+The reference basis (PC, COA, LOGIC, ALLOCATION, FTE, REV) can be maintained per
+month in `cost_distribution_db` instead of Excel, so it can be edited via SQL or
+a future app. Each row is tagged with a `period` (`YYYY-MM`), giving every month
+its own independently-editable basis version.
+
+```bash
+# 1. seed a period's basis from the workbook (idempotent per period)
+PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --import-basis --period 2026-04
+
+# 2. edit the basis_* tables in MySQL as needed (basis_logic, basis_allocation, …)
+
+# 3. run using the DB basis for that period (GL still from the workbook feed)
+PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline \
+    --basis-from-db --period 2026-04 --to-db
+```
+
+Tables: `basis_pc`, `basis_coa`, `basis_logic`, `basis_allocation`, `basis_fte`,
+`basis_rev`. Output rows and each `distribution_run` are tagged with the same
+`period`; a `--to-db` run replaces only that period's snapshot. Percentages are
+stored at `DECIMAL(30,20)` so FTE/Revenue shares still sum to exactly 1 and the
+allocation ties out to source. Schema is Alembic-managed under `alembic/cost/`.

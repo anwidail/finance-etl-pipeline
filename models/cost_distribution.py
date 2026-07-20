@@ -32,6 +32,7 @@ class Distribution(CostDistributionBase):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     run_id = Column(Integer, nullable=True, index=True)
+    period = Column(String(7), nullable=True, index=True)  # 'YYYY-MM'
     gl_line_id = Column(Integer, nullable=True, index=True)
 
     date = Column(Date, nullable=True, index=True)
@@ -70,6 +71,7 @@ class DistributionRun(CostDistributionBase):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     run_at = Column(DateTime, nullable=True, index=True)
+    period = Column(String(7), nullable=True, index=True)  # 'YYYY-MM'
 
     source_total = Column(Numeric(20, 2), nullable=True)
     allocated_total = Column(Numeric(20, 2), nullable=True)
@@ -83,3 +85,91 @@ class DistributionRun(CostDistributionBase):
 
     recompute_basis = Column(Integer, nullable=True)  # 0/1 flag
     input_path = Column(String(500), nullable=True)
+
+
+# ---------------------------------------------------------------------------
+# Editable monthly basis tables
+# ---------------------------------------------------------------------------
+# These mirror the workbook's reference sheets so the distribution basis can be
+# maintained per period (YYYY-MM) directly in MySQL — edited via SQL or a future
+# app — instead of editing Excel. Seed them with
+# ``load.cost_distribution_basis.import_basis_from_workbook`` and run the
+# pipeline with ``--basis-from-db --period YYYY-MM``. Every row carries a
+# ``period`` so each month has its own independently-editable basis version.
+
+
+class _BasisMixin:
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    period = Column(String(7), nullable=False, index=True)  # 'YYYY-MM'
+    created_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, nullable=True)
+
+
+class BasisPC(CostDistributionBase, _BasisMixin):
+    """Cost-/profit-centre master (workbook sheet ``PC``)."""
+    __tablename__ = "basis_pc"
+    dept_code = Column(String(50), nullable=True, index=True)
+    dept = Column(String(200), nullable=True, index=True)
+    div = Column(String(200), nullable=True)
+    pc = Column(String(200), nullable=True, index=True)
+
+
+class BasisCOA(CostDistributionBase, _BasisMixin):
+    """Chart of accounts (workbook sheet ``COA``)."""
+    __tablename__ = "basis_coa"
+    code = Column(String(50), nullable=True, index=True)
+    account_name = Column(String(200), nullable=True)
+    reporting_line = Column(String(200), nullable=True)
+
+
+class BasisLogic(CostDistributionBase, _BasisMixin):
+    """Distribution rule table (workbook sheet ``LOGIC``).
+
+    Rule key is (account_code, account_name, pc-bucket) -> distribution method.
+    """
+    __tablename__ = "basis_logic"
+    account_code = Column(String(50), nullable=True, index=True)
+    account_name = Column(String(200), nullable=True, index=True)
+    pc = Column(String(200), nullable=True, index=True)          # bucket
+    distribution = Column(String(100), nullable=True, index=True)  # method
+    code = Column(String(300), nullable=True)                    # descriptive id
+
+
+class BasisAllocation(CostDistributionBase, _BasisMixin):
+    """Split-factor table (workbook sheet ``ALLOCATION``).
+
+    ``account_name`` is only populated for the ``Lab Distribution`` method.
+    """
+    __tablename__ = "basis_allocation"
+    distribution = Column(String(100), nullable=True, index=True)  # method
+    account_name = Column(String(200), nullable=True, index=True)
+    new_dept = Column(String(200), nullable=True, index=True)
+    # High precision: FTE/Revenue shares are repeating decimals that must sum to
+    # exactly 1 per method, or the allocation no longer ties out to source.
+    percentage = Column(Numeric(30, 20), nullable=True)
+
+
+class BasisFTE(CostDistributionBase, _BasisMixin):
+    """Headcount register (workbook sheet ``FTE``) — basis for FTE-* recompute."""
+    __tablename__ = "basis_fte"
+    fte = Column(Numeric(18, 6), nullable=True)
+    hc = Column(Numeric(18, 6), nullable=True)
+    name = Column(String(200), nullable=True)
+    employee_no = Column(String(50), nullable=True, index=True)
+    dept = Column(String(200), nullable=True, index=True)
+    div = Column(String(200), nullable=True)
+    pc = Column(String(200), nullable=True)
+    location = Column(String(200), nullable=True, index=True)
+    location_detail = Column(String(200), nullable=True)
+
+
+class BasisREV(CostDistributionBase, _BasisMixin):
+    """Revenue basis (workbook sheet ``REV``) — basis for Revenue-* recompute."""
+    __tablename__ = "basis_rev"
+    div = Column(String(200), nullable=True, index=True)
+    pc = Column(String(200), nullable=True)
+    location = Column(String(200), nullable=True)
+    amount = Column(Numeric(20, 2), nullable=True)
+    pct_certification_services = Column(Numeric(30, 20), nullable=True)
+    pct_ho = Column(Numeric(30, 20), nullable=True)
+    pct_all = Column(Numeric(30, 20), nullable=True)

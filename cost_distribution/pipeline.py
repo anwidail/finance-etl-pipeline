@@ -388,8 +388,21 @@ def load(cfg: Config, out: pd.DataFrame, rejects: pd.DataFrame, recon: Recon) ->
 # Orchestrator
 # ---------------------------------------------------------------------------
 def run(cfg: Config, dry_run: bool = False, recompute_basis: bool = False,
-        to_db: bool = False):
+        to_db: bool = False, period: str = None, basis_from_db: bool = False):
     sheets = extract(cfg)
+
+    # Optionally take the reference/basis sheets from the editable MySQL tables
+    # for this period instead of the workbook. GL (the monthly fact) still comes
+    # from the workbook feed.
+    if basis_from_db:
+        if not period:
+            raise ValueError("--basis-from-db requires --period YYYY-MM")
+        from load.cost_distribution_basis import read_basis_from_db
+        from load.cost_distribution_db import get_cost_engine
+        db_sheets = read_basis_from_db(period, get_cost_engine())
+        sheets.update(db_sheets)  # PC/COA/LOGIC/ALLOCATION/FTE/REV from DB
+        logger.info("loaded basis from cost_distribution_db for period %s", period)
+
     if recompute_basis:
         from cost_distribution.basis import recompute_allocation, verify_against
         refreshed = recompute_allocation(cfg, sheets["ALLOCATION"], sheets["FTE"], sheets["REV"])
@@ -406,8 +419,10 @@ def run(cfg: Config, dry_run: bool = False, recompute_basis: bool = False,
         load(cfg, out, rejects, recon)
         if to_db:
             from load.cost_distribution_db import load_to_db
-            run_id = load_to_db(out, recon, cfg, recompute_basis=recompute_basis)
-            logger.info("loaded snapshot to cost_distribution_db (run_id=%s)", run_id)
+            run_id = load_to_db(out, recon, cfg, recompute_basis=recompute_basis,
+                                period=period)
+            logger.info("loaded snapshot to cost_distribution_db (run_id=%s, period=%s)",
+                        run_id, period)
     return out, rejects, recon
 
 
@@ -419,6 +434,12 @@ def main() -> None:
                         help="recompute FTE-*/Revenue-* factors from the FTE/REV sheets")
     parser.add_argument("--to-db", action="store_true",
                         help="also load the snapshot into cost_distribution_db (MySQL)")
+    parser.add_argument("--period", help="monthly basis period, e.g. 2026-04")
+    parser.add_argument("--basis-from-db", action="store_true",
+                        help="read PC/COA/LOGIC/ALLOCATION/FTE/REV from the DB basis "
+                             "tables for --period instead of the workbook")
+    parser.add_argument("--import-basis", action="store_true",
+                        help="seed the DB basis tables for --period from the workbook, then exit")
     parser.add_argument("--input", help="override input workbook path")
     parser.add_argument("--output", help="override output workbook path")
     args = parser.parse_args()
@@ -442,8 +463,17 @@ def main() -> None:
     if args.output:
         cfg = Config(input_path=cfg.input_path, output_path=args.output)
 
+    if args.import_basis:
+        if not args.period:
+            parser.error("--import-basis requires --period YYYY-MM")
+        from load.cost_distribution_basis import import_basis_from_workbook
+        from load.cost_distribution_db import get_cost_engine
+        counts = import_basis_from_workbook(cfg, args.period, get_cost_engine())
+        logger.info("seeded basis for period %s: %s", args.period, counts)
+        return
+
     run(cfg, dry_run=args.dry_run, recompute_basis=args.recompute_basis,
-        to_db=args.to_db)
+        to_db=args.to_db, period=args.period, basis_from_db=args.basis_from_db)
 
 
 if __name__ == "__main__":
