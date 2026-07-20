@@ -456,6 +456,7 @@ def run(cfg: Config, dry_run: bool = False, recompute_basis: bool = False,
         sheets.update(db_sheets)  # PC/COA/LOGIC/ALLOCATION/FTE/REV from DB
         logger.info("loaded basis from cost_distribution_db for period %s", period)
 
+    refreshed = None
     if recompute_basis:
         from cost_distribution.basis import recompute_allocation, verify_against
         refreshed = recompute_allocation(cfg, sheets["ALLOCATION"], sheets["FTE"], sheets["REV"])
@@ -468,14 +469,36 @@ def run(cfg: Config, dry_run: bool = False, recompute_basis: bool = False,
     recon = validate(cfg, resolved, out, rejects, lk)
     if dry_run:
         logger.info("dry-run: validation passed, nothing written")
-    else:
-        load(cfg, out, rejects, recon)
-        if to_db:
-            from load.cost_distribution_db import load_to_db
-            run_id = load_to_db(out, recon, cfg, recompute_basis=recompute_basis,
-                                period=period)
-            logger.info("loaded snapshot to cost_distribution_db (run_id=%s, period=%s)",
-                        run_id, period)
+        return out, rejects, recon
+
+    # Any DB write for this period (snapshot or recompute-persist) requires the
+    # period to be open — check before writing anything so a closed period stays
+    # fully frozen.
+    persist = refreshed is not None and period
+    writes_db = to_db or persist
+    engine = None
+    if writes_db:
+        from load.cost_distribution_db import get_cost_engine
+        from load.cost_distribution_period import assert_period_open
+        engine = get_cost_engine()
+        assert_period_open(engine, period, "write cost_distribution_db")
+
+    load(cfg, out, rejects, recon)
+
+    # Persist the recomputed ALLOCATION back so the stored basis stays in sync
+    # (full replace of this period's rows — no duplicate build-up).
+    if persist:
+        from load.cost_distribution_basis import persist_allocation
+        n = persist_allocation(period, refreshed, engine)
+        logger.info("persisted recomputed ALLOCATION to basis_allocation "
+                    "for period %s (%d rows)", period, n)
+
+    if to_db:
+        from load.cost_distribution_db import load_to_db
+        run_id = load_to_db(out, recon, cfg, recompute_basis=recompute_basis,
+                            period=period, engine=engine)
+        logger.info("loaded snapshot to cost_distribution_db (run_id=%s, period=%s)",
+                    run_id, period)
     return out, rejects, recon
 
 
@@ -500,6 +523,11 @@ def main() -> None:
                         help="seed the gl_entry table for --period from the workbook, then exit")
     parser.add_argument("--gl-from-db", action="store_true",
                         help="read the GL fact from gl_entry for --period instead of the workbook")
+    parser.add_argument("--close-period", action="store_true",
+                        help="lock --period against further writes, then exit")
+    parser.add_argument("--reopen-period", action="store_true",
+                        help="unlock --period, then exit")
+    parser.add_argument("--note", help="note stored with --close-period")
     parser.add_argument("--input", help="override input workbook path")
     parser.add_argument("--output", help="override output workbook path")
     args = parser.parse_args()
@@ -526,12 +554,30 @@ def main() -> None:
     # Canonicalise the period to MMM-YYYY (accepts APR-2026 or 2026-04).
     period = normalize_period(args.period) if args.period else None
 
+    if args.close_period or args.reopen_period:
+        if not period:
+            parser.error("--close-period/--reopen-period require --period MMM-YYYY")
+        from load.cost_distribution_db import get_cost_engine
+        from load.cost_distribution_period import close_period, reopen_period
+        engine = get_cost_engine()
+        if args.close_period:
+            close_period(engine, period, note=args.note)
+            logger.info("closed period %s (locked against writes)", period)
+        else:
+            existed = reopen_period(engine, period)
+            logger.info("reopened period %s%s", period,
+                        "" if existed else " (was not closed)")
+        return
+
     if args.import_basis:
         if not period:
             parser.error("--import-basis requires --period MMM-YYYY (e.g. APR-2026)")
         from load.cost_distribution_basis import import_basis_from_workbook
         from load.cost_distribution_db import get_cost_engine
-        counts = import_basis_from_workbook(cfg, period, get_cost_engine(),
+        from load.cost_distribution_period import assert_period_open
+        engine = get_cost_engine()
+        assert_period_open(engine, period, "seed basis")
+        counts = import_basis_from_workbook(cfg, period, engine,
                                             refresh_global=args.reseed_global)
         logger.info("seeded basis for period %s: %s (global refreshed=%s)",
                     period, counts, args.reseed_global)
@@ -542,7 +588,10 @@ def main() -> None:
             parser.error("--import-gl requires --period MMM-YYYY (e.g. APR-2026)")
         from load.cost_distribution_gl import import_gl_from_workbook
         from load.cost_distribution_db import get_cost_engine
-        n = import_gl_from_workbook(cfg, period, get_cost_engine())
+        from load.cost_distribution_period import assert_period_open
+        engine = get_cost_engine()
+        assert_period_open(engine, period, "seed gl_entry")
+        n = import_gl_from_workbook(cfg, period, engine)
         logger.info("seeded gl_entry for period %s: %d lines", period, n)
         return
 

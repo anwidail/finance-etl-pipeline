@@ -141,3 +141,33 @@ def read_basis_from_db(period: str, engine) -> Dict[str, pd.DataFrame]:
             ]
             out[sheet] = pd.DataFrame(data, columns=list(colmap.values()))
     return out
+
+
+def persist_allocation(period: str, refreshed_alloc: pd.DataFrame, engine,
+                       chunk_size: int = 1000) -> int:
+    """Replace ``basis_allocation`` for ``period`` with a refreshed ALLOCATION.
+
+    Used to write recomputed FTE-*/Revenue-* factors back so the stored basis
+    stays consistent (a full replace of that period's rows — no duplicate rows
+    accumulate on repeated recomputes). Returns the row count written.
+    """
+    df = refreshed_alloc.copy()
+    Session = sessionmaker(bind=engine, future=True)
+    now = datetime.now(timezone.utc)
+    with Session() as session:
+        session.execute(delete(BasisAllocation).where(BasisAllocation.period == period))
+        records = []
+        for _, row in df.iterrows():
+            records.append({
+                "distribution": _clean(row.get("Distribution")),
+                "account_name": _clean(row.get("Account Name")),
+                "new_dept": _clean(row.get("New Dept")),
+                "percentage": _clean(row.get("Percentage")),
+                "period": period,
+                "created_at": now,
+                "updated_at": now,
+            })
+        for i in range(0, len(records), chunk_size):
+            session.bulk_insert_mappings(BasisAllocation, records[i:i + chunk_size])
+        session.commit()
+    return len(records)

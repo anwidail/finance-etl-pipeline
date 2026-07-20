@@ -209,3 +209,18 @@ class GLEntry(CostDistributionBase, _PeriodMixin):
     balance = Column(Numeric(28, 12), nullable=True)
     account_code = Column(String(50), nullable=True, index=True)
     account_name = Column(String(200), nullable=True, index=True)
+
+
+class PeriodClose(CostDistributionBase):
+    """Period lock — a closed period is frozen against any further writes.
+
+    Presence of a row with ``status='closed'`` means the period's GL, basis and
+    distribution snapshot are locked: seeding, recompute-persist and snapshot
+    loads for it are refused until it is reopened. Reads/reports are unaffected.
+    """
+
+    __tablename__ = "period_close"
+    period = Column(String(10), primary_key=True)  # 'MMM-YYYY'
+    status = Column(String(10), nullable=False, default="closed")  # closed
+    closed_at = Column(DateTime, nullable=True)
+    note = Column(String(300), nullable=True)

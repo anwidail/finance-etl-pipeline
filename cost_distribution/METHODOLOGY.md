@@ -122,6 +122,35 @@ PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline \
 `gl_entry` stores Debit/Credit at `DECIMAL(28,12)` so FX-converted lines keep
 their sub-cent precision and the source total matches the workbook to the cent.
 
+### Updating FTE / REV and recompute
+
+Edit `basis_fte` (headcount) or `basis_rev` (revenue) for the period, then run
+with `--recompute-basis`: the FTE-*/Revenue-* factors are recomputed and
+**written straight back into `basis_allocation`** for that period (a full
+replace — no duplicate rows accumulate), so the stored basis stays consistent
+whether or not a later run uses `--recompute-basis`.
+
+```bash
+# after editing basis_fte / basis_rev for APR-2026:
+PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline \
+    --gl-from-db --basis-from-db --recompute-basis --period APR-2026 --to-db
+```
+
+### Closing a period
+
+Once a month's report is final, lock it so re-runs cannot overwrite it:
+
+```bash
+PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --close-period --period APR-2026 --note "final"
+PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --reopen-period --period APR-2026
+```
+
+A closed period (a row in `period_close`) refuses every write for that period —
+`--import-basis`, `--import-gl`, recompute-persist and `--to-db` snapshot loads
+all fail closed until it is reopened. Reads/reports (`--dry-run`, Excel-only
+runs) are unaffected, so past periods stay frozen while you keep working on the
+current month.
+
 Re-importing another month never clobbers policy edits (policy tables are only
 seeded when empty, unless `--reseed-global`). Output rows and each
 `distribution_run` are tagged with the `period`; a `--to-db` run replaces only
