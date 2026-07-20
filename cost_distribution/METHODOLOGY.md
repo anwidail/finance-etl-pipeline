@@ -105,6 +105,23 @@ PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline \
     --basis-from-db --period APR-2026 --to-db
 ```
 
+### Fully DB-driven month
+
+The GL fact can also live in MySQL (`gl_entry`, period-scoped), so a whole month
+runs without the workbook — the shape an app would drive:
+
+```bash
+# seed the month's GL from the workbook (only that month's lines)
+PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --import-gl --period APR-2026
+
+# run entirely from the database: GL + basis from MySQL, snapshot back to MySQL
+PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline \
+    --gl-from-db --basis-from-db --period APR-2026 --to-db
+```
+
+`gl_entry` stores Debit/Credit at `DECIMAL(28,12)` so FX-converted lines keep
+their sub-cent precision and the source total matches the workbook to the cent.
+
 Re-importing another month never clobbers policy edits (policy tables are only
 seeded when empty, unless `--reseed-global`). Output rows and each
 `distribution_run` are tagged with the `period`; a `--to-db` run replaces only

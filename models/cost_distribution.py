@@ -184,3 +184,28 @@ class BasisREV(CostDistributionBase, _PeriodMixin):
     pct_certification_services = Column(Numeric(30, 20), nullable=True)
     pct_ho = Column(Numeric(30, 20), nullable=True)
     pct_all = Column(Numeric(30, 20), nullable=True)
+
+
+class GLEntry(CostDistributionBase, _PeriodMixin):
+    """General ledger cost lines (workbook sheet ``GL``) — the monthly fact.
+
+    Period-scoped so a whole month can run fully from MySQL (``--gl-from-db``)
+    instead of the workbook feed. Mirrors the GL sheet's columns 1:1.
+    """
+    __tablename__ = "gl_entry"
+    date = Column(Date, nullable=True, index=True)
+    type = Column(String(50), nullable=True)
+    ref_no = Column(String(100), nullable=True, index=True)
+    contact = Column(String(200), nullable=True)
+    description = Column(Text, nullable=True)
+    note = Column(Text, nullable=True)
+    dept = Column(String(200), nullable=True, index=True)
+    project = Column(String(200), nullable=True)
+    curr = Column(String(10), nullable=True)
+    # High precision: source Debit/Credit carry up to ~11 decimals (FX-converted
+    # lines); storing at (18,2) would shift the source total off the workbook.
+    debit = Column(Numeric(28, 12), nullable=True)
+    credit = Column(Numeric(28, 12), nullable=True)
+    balance = Column(Numeric(28, 12), nullable=True)
+    account_code = Column(String(50), nullable=True, index=True)
+    account_name = Column(String(200), nullable=True, index=True)

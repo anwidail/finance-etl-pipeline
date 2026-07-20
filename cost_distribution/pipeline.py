@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
 from dataclasses import dataclass
 from typing import Dict
 
@@ -27,42 +26,11 @@ import numpy as np
 import pandas as pd
 
 from cost_distribution.config import Config, OUTPUT_COLUMNS, load_config
+from cost_distribution.periods import (
+    date_to_period, date_to_period_series, normalize_period,
+)
 
 logger = logging.getLogger("cost_distribution")
-
-# Period label = month of the GL date, written MMM-YYYY (e.g. APR-2026), anchored
-# at the 1st of the month. Fixed English abbreviations (locale-independent).
-_MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
-           "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-
-
-def date_to_period(value) -> str | None:
-    """One date -> 'MMM-YYYY' (e.g. 2026-04-08 -> 'APR-2026'). None if unparseable."""
-    ts = pd.to_datetime(value, errors="coerce")
-    if pd.isna(ts):
-        return None
-    return f"{_MONTHS[ts.month - 1]}-{ts.year}"
-
-
-def date_to_period_series(dates: pd.Series) -> pd.Series:
-    """Vectorised date -> 'MMM-YYYY' period label."""
-    return pd.to_datetime(dates, errors="coerce").apply(date_to_period)
-
-
-def normalize_period(text: str) -> str:
-    """Canonicalise a period string to 'MMM-YYYY'.
-
-    Accepts 'APR-2026' (any case) or 'YYYY-MM' (e.g. '2026-04') for convenience.
-    """
-    s = (text or "").strip().upper()
-    if re.fullmatch(r"[A-Z]{3}-\d{4}", s) and s[:3] in _MONTHS:
-        return s
-    m = re.fullmatch(r"(\d{4})-(\d{2})", s)
-    if m:
-        year, mon = int(m.group(1)), int(m.group(2))
-        if 1 <= mon <= 12:
-            return f"{_MONTHS[mon - 1]}-{year}"
-    raise ValueError(f"Invalid --period {text!r}; expected MMM-YYYY like APR-2026")
 
 # Internal-only helper columns, stripped before writing the final frame.
 _BUCKET = "_bucket"
@@ -457,8 +425,20 @@ def load(cfg: Config, out: pd.DataFrame, rejects: pd.DataFrame, recon: Recon) ->
 # Orchestrator
 # ---------------------------------------------------------------------------
 def run(cfg: Config, dry_run: bool = False, recompute_basis: bool = False,
-        to_db: bool = False, period: str = None, basis_from_db: bool = False):
+        to_db: bool = False, period: str = None, basis_from_db: bool = False,
+        gl_from_db: bool = False):
     sheets = extract(cfg)
+
+    # Optionally take the GL fact from MySQL for this period instead of the
+    # workbook (a fully DB-driven monthly run).
+    if gl_from_db:
+        if not period:
+            raise ValueError("--gl-from-db requires --period MMM-YYYY")
+        from load.cost_distribution_gl import read_gl_from_db
+        from load.cost_distribution_db import get_cost_engine
+        sheets["GL"] = read_gl_from_db(period, get_cost_engine())
+        logger.info("loaded GL from cost_distribution_db for period %s (%d lines)",
+                    period, len(sheets["GL"]))
 
     # Tie the run to a month: apply this period's basis only to this period's GL.
     if period:
@@ -516,6 +496,10 @@ def main() -> None:
     parser.add_argument("--reseed-global", action="store_true",
                         help="with --import-basis, also refresh the global policy tables "
                              "(PC/COA/LOGIC) from the workbook")
+    parser.add_argument("--import-gl", action="store_true",
+                        help="seed the gl_entry table for --period from the workbook, then exit")
+    parser.add_argument("--gl-from-db", action="store_true",
+                        help="read the GL fact from gl_entry for --period instead of the workbook")
     parser.add_argument("--input", help="override input workbook path")
     parser.add_argument("--output", help="override output workbook path")
     args = parser.parse_args()
@@ -553,8 +537,18 @@ def main() -> None:
                     period, counts, args.reseed_global)
         return
 
+    if args.import_gl:
+        if not period:
+            parser.error("--import-gl requires --period MMM-YYYY (e.g. APR-2026)")
+        from load.cost_distribution_gl import import_gl_from_workbook
+        from load.cost_distribution_db import get_cost_engine
+        n = import_gl_from_workbook(cfg, period, get_cost_engine())
+        logger.info("seeded gl_entry for period %s: %d lines", period, n)
+        return
+
     run(cfg, dry_run=args.dry_run, recompute_basis=args.recompute_basis,
-        to_db=args.to_db, period=period, basis_from_db=args.basis_from_db)
+        to_db=args.to_db, period=period, basis_from_db=args.basis_from_db,
+        gl_from_db=args.gl_from_db)
 
 
 if __name__ == "__main__":
