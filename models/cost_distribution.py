@@ -32,7 +32,7 @@ class Distribution(CostDistributionBase):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     run_id = Column(Integer, nullable=True, index=True)
-    period = Column(String(7), nullable=True, index=True)  # 'YYYY-MM'
+    period = Column(String(10), nullable=True, index=True)  # 'MMM-YYYY'
     gl_line_id = Column(Integer, nullable=True, index=True)
 
     date = Column(Date, nullable=True, index=True)
@@ -71,7 +71,7 @@ class DistributionRun(CostDistributionBase):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     run_at = Column(DateTime, nullable=True, index=True)
-    period = Column(String(7), nullable=True, index=True)  # 'YYYY-MM'
+    period = Column(String(10), nullable=True, index=True)  # 'MMM-YYYY'
 
     source_total = Column(Numeric(20, 2), nullable=True)
     allocated_total = Column(Numeric(20, 2), nullable=True)
@@ -113,7 +113,7 @@ class _RefMixin:
 
 class _PeriodMixin(_RefMixin):
     """Basis tables scoped to a month."""
-    period = Column(String(7), nullable=False, index=True)  # 'YYYY-MM'
+    period = Column(String(10), nullable=False, index=True)  # 'MMM-YYYY'
 
 
 class BasisPC(CostDistributionBase, _RefMixin):

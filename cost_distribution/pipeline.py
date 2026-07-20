@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 from dataclasses import dataclass
 from typing import Dict
 
@@ -28,6 +29,40 @@ import pandas as pd
 from cost_distribution.config import Config, OUTPUT_COLUMNS, load_config
 
 logger = logging.getLogger("cost_distribution")
+
+# Period label = month of the GL date, written MMM-YYYY (e.g. APR-2026), anchored
+# at the 1st of the month. Fixed English abbreviations (locale-independent).
+_MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+           "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+
+
+def date_to_period(value) -> str | None:
+    """One date -> 'MMM-YYYY' (e.g. 2026-04-08 -> 'APR-2026'). None if unparseable."""
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return None
+    return f"{_MONTHS[ts.month - 1]}-{ts.year}"
+
+
+def date_to_period_series(dates: pd.Series) -> pd.Series:
+    """Vectorised date -> 'MMM-YYYY' period label."""
+    return pd.to_datetime(dates, errors="coerce").apply(date_to_period)
+
+
+def normalize_period(text: str) -> str:
+    """Canonicalise a period string to 'MMM-YYYY'.
+
+    Accepts 'APR-2026' (any case) or 'YYYY-MM' (e.g. '2026-04') for convenience.
+    """
+    s = (text or "").strip().upper()
+    if re.fullmatch(r"[A-Z]{3}-\d{4}", s) and s[:3] in _MONTHS:
+        return s
+    m = re.fullmatch(r"(\d{4})-(\d{2})", s)
+    if m:
+        year, mon = int(m.group(1)), int(m.group(2))
+        if 1 <= mon <= 12:
+            return f"{_MONTHS[mon - 1]}-{year}"
+    raise ValueError(f"Invalid --period {text!r}; expected MMM-YYYY like APR-2026")
 
 # Internal-only helper columns, stripped before writing the final frame.
 _BUCKET = "_bucket"
@@ -96,7 +131,7 @@ def extract(cfg: Config) -> Dict[str, pd.DataFrame]:
 
 
 def filter_gl_to_period(gl: pd.DataFrame, period: str) -> pd.DataFrame:
-    """Keep only GL lines whose Date falls in ``period`` (YYYY-MM).
+    """Keep only GL lines whose Date falls in ``period`` (MMM-YYYY, e.g. APR-2026).
 
     This ties the monthly basis to the GL of the same month: a period's
     ALLOCATION/FTE/REV factors are applied only to that period's cost lines.
@@ -104,7 +139,7 @@ def filter_gl_to_period(gl: pd.DataFrame, period: str) -> pd.DataFrame:
     an unparseable date.
     """
     dates = pd.to_datetime(gl["Date"], errors="coerce")
-    gl_period = dates.dt.strftime("%Y-%m")
+    gl_period = date_to_period_series(gl["Date"])
     mask = gl_period == period
 
     n_total = len(gl)
@@ -279,6 +314,10 @@ def enrich(children: pd.DataFrame, lk: Lookups) -> pd.DataFrame:
     # Audit label: method / receiving dept (blank for direct charges).
     label = df[_METHOD].astype("string").fillna("") + " / " + df["New Dept"].fillna("")
     df["Distribution And Allocation"] = label.where(df[_METHOD].notna(), other=pd.NA)
+
+    # Period derived per-row from the GL date (MMM-YYYY), same rule as the GL
+    # filter — so the distribution snapshot is self-describing by month.
+    df["period"] = date_to_period_series(df["Date"])
 
     # Deterministic ordering: source line, then receiving dept.
     df = df.sort_values([_GL_ID, "New Dept"], kind="stable").reset_index(drop=True)
@@ -468,7 +507,7 @@ def main() -> None:
                         help="recompute FTE-*/Revenue-* factors from the FTE/REV sheets")
     parser.add_argument("--to-db", action="store_true",
                         help="also load the snapshot into cost_distribution_db (MySQL)")
-    parser.add_argument("--period", help="monthly basis period, e.g. 2026-04")
+    parser.add_argument("--period", help="monthly basis period, MMM-YYYY e.g. APR-2026")
     parser.add_argument("--basis-from-db", action="store_true",
                         help="read PC/COA/LOGIC/ALLOCATION/FTE/REV from the DB basis "
                              "tables for --period instead of the workbook")
@@ -500,19 +539,22 @@ def main() -> None:
     if args.output:
         cfg = Config(input_path=cfg.input_path, output_path=args.output)
 
+    # Canonicalise the period to MMM-YYYY (accepts APR-2026 or 2026-04).
+    period = normalize_period(args.period) if args.period else None
+
     if args.import_basis:
-        if not args.period:
-            parser.error("--import-basis requires --period YYYY-MM")
+        if not period:
+            parser.error("--import-basis requires --period MMM-YYYY (e.g. APR-2026)")
         from load.cost_distribution_basis import import_basis_from_workbook
         from load.cost_distribution_db import get_cost_engine
-        counts = import_basis_from_workbook(cfg, args.period, get_cost_engine(),
+        counts = import_basis_from_workbook(cfg, period, get_cost_engine(),
                                             refresh_global=args.reseed_global)
         logger.info("seeded basis for period %s: %s (global refreshed=%s)",
-                    args.period, counts, args.reseed_global)
+                    period, counts, args.reseed_global)
         return
 
     run(cfg, dry_run=args.dry_run, recompute_basis=args.recompute_basis,
-        to_db=args.to_db, period=args.period, basis_from_db=args.basis_from_db)
+        to_db=args.to_db, period=period, basis_from_db=args.basis_from_db)
 
 
 if __name__ == "__main__":

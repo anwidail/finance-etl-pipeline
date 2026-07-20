@@ -11,7 +11,7 @@ import os
 from datetime import datetime, timezone
 
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from models.cost_distribution import CostDistributionBase, Distribution, DistributionRun
@@ -77,6 +77,8 @@ def _rows_from_output(out: pd.DataFrame, run_id: int, loaded_at: datetime,
     # Carry method + gl_line_id from the internal helper columns if present.
     method = df["_method"] if "_method" in df.columns else pd.Series([None] * len(df))
     gl_id = df["gl_line_id"] if "gl_line_id" in df.columns else pd.Series([None] * len(df))
+    # Per-row period derived from the GL date (MMM-YYYY); fall back to the run's.
+    row_period = df["period"] if "period" in df.columns else pd.Series([period] * len(df))
 
     records = []
     for i in range(len(df)):
@@ -86,7 +88,8 @@ def _rows_from_output(out: pd.DataFrame, run_id: int, loaded_at: datetime,
         row["method"] = None if pd.isna(method.iloc[i]) else method.iloc[i]
         row["gl_line_id"] = None if pd.isna(gl_id.iloc[i]) else int(gl_id.iloc[i])
         row["run_id"] = run_id
-        row["period"] = period
+        rp = row_period.iloc[i]
+        row["period"] = period if pd.isna(rp) else rp
         row["loaded_at"] = loaded_at
         records.append(row)
     return records
@@ -123,13 +126,26 @@ def load_to_db(out: pd.DataFrame, recon, cfg, recompute_basis: bool = False,
         session.flush()  # assign run.id
         run_id = run.id
 
-        # Idempotent snapshot: clear this period's rows (or the whole table when
-        # no period is given), then insert this run's rows.
-        if period:
-            session.execute(text("DELETE FROM distribution WHERE period = :p"), {"p": period})
+        records = _rows_from_output(out, run_id, now, period=period)
+
+        # Idempotent snapshot: clear exactly the periods present in this batch
+        # (each period derived per-row from the GL date), then insert.
+        periods = sorted({r["period"] for r in records if r["period"]})
+
+        # Record the run's period: the requested one, else the single period the
+        # output covers (None when a no-period batch spans several months).
+        if run.period is None and len(periods) == 1:
+            run.period = periods[0]
+        if periods:
+            session.execute(
+                text("DELETE FROM distribution WHERE period IN :ps").bindparams(
+                    bindparam("ps", expanding=True)
+                ),
+                {"ps": periods},
+            )
         else:
             session.execute(text("DELETE FROM distribution WHERE period IS NULL"))
-        records = _rows_from_output(out, run_id, now, period=period)
+
         for i in range(0, len(records), chunk_size):
             session.bulk_insert_mappings(Distribution, records[i:i + chunk_size])
 

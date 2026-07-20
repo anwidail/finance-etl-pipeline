@@ -86,21 +86,23 @@ so it can be edited via SQL or a future app. There are two kinds:
 | Kind | Tables | Period? | Changes |
 |---|---|---|---|
 | **Policy** | `basis_pc`, `basis_coa`, `basis_logic` | no | only on a policy change |
-| **Monthly** | `basis_allocation`, `basis_fte`, `basis_rev` | `period` (YYYY-MM) | each month |
+| **Monthly** | `basis_allocation`, `basis_fte`, `basis_rev` | `period` (MMM-YYYY) | each month |
 
 Policy tables hold a single current version; the monthly tables carry a `period`
-so every month has its own independently-editable split factors.
+so every month has its own independently-editable split factors. The period
+label is `MMM-YYYY` (e.g. `APR-2026`), derived from the GL date's month; the CLI
+also accepts `YYYY-MM` and normalises it.
 
 ```bash
 # 1. seed: policy tables once (skipped if already present), the month's factors
-PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --import-basis --period 2026-04
+PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --import-basis --period APR-2026
 #    to also refresh the policy tables from the workbook, add --reseed-global
 
 # 2. edit the basis_* tables in MySQL as needed
 
 # 3. run using the DB basis for that period (GL still from the workbook feed)
 PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline \
-    --basis-from-db --period 2026-04 --to-db
+    --basis-from-db --period APR-2026 --to-db
 ```
 
 Re-importing another month never clobbers policy edits (policy tables are only
@@ -110,8 +112,10 @@ that period's snapshot. Percentages are stored `DECIMAL(30,20)` so FTE/Revenue
 shares still sum to exactly 1 and the allocation ties out. Schema is
 Alembic-managed under `alembic/cost/`.
 
-**Period ties basis to GL.** When `--period` is given, the GL is filtered to
-lines whose date falls in that month, so a period's ALLOCATION/FTE/REV factors
-are applied only to that period's cost lines (the run fails if no GL line
-matches, and warns if lines from other months are dropped). Without `--period`
-the whole workbook GL is processed as one batch.
+**Period ties basis to GL.** The GL has no period column; the period is derived
+from the `Date` (month → `MMM-YYYY`, e.g. `APR-2026`). When `--period` is given,
+the GL is filtered to lines in that month, so a period's ALLOCATION/FTE/REV
+factors are applied only to that period's cost lines (the run fails if no GL line
+matches, warns if other-month lines are dropped). Every `distribution` row is
+tagged with its own date-derived `period` the same way — so the snapshot is
+self-describing by month even for a no-`--period` batch run.
