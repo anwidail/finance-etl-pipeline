@@ -1,0 +1,76 @@
+# Automated Cost Distribution — Methodology Note
+
+*Stakeholder-facing summary. A controller can sign off the allocation from this
+page without reading code.*
+
+## What it does
+
+Every cost line in the **General Ledger** (`GL`, 2.437 lines) is pushed to the
+department(s) that should ultimately bear the cost. A line is either:
+
+- **charged directly** to its originating department (no distribution rule), or
+- **distributed** across several *receiving* departments using a fixed set of
+  split percentages.
+
+The result is one tidy `Distribution` table (3.700 rows) that reproduces the
+Excel workbook exactly.
+
+## The rule → basis mechanism
+
+1. **Which bucket?** Each originating department maps to a *profit-centre bucket*
+   via the `PC` master (e.g. *Head Quarter*, *Laboratory Operation Support*).
+2. **Which method?** The pair **(Account Code, Account Name, bucket)** looks up a
+   *distribution method* in the `LOGIC` rule table (e.g. `FTE - Head Office`,
+   `Revenue HO`, `Lab Distribution`). No rule ⇒ **direct charge**.
+3. **What split?** The method looks up its receiving departments and percentages
+   in the `ALLOCATION` basis table. `Lab Distribution` splits differ by account,
+   so it is keyed on the account name as well.
+4. **Enrich.** Each output row gets the receiving department's `Div`/`PC` and the
+   account's `Reporting Line`.
+
+The split percentages themselves trace back to headcount (`FTE`) and revenue
+(`REV`) bases; `ALLOCATION` is treated as authoritative for this run.
+
+## Controls (the run fails closed on any breach)
+
+| # | Control | Result |
+|---|---|---|
+| 1 | Grand-total tie-out (allocated = source) | **✓ variance 0.00** |
+| 2 | Per-line conservation (Σ children = line amount) | **✓** |
+| 3 | Percentage sets sum to 1 per method | ✓ (warns otherwise) |
+| 4 | No orphan rules (every method has a basis) | **✓ 0 rejects** |
+| 5 | Referential integrity (Dept/Code exist in masters) | ✓ misses listed |
+| 6 | Row-count sanity (direct vs distributed) | **✓ 2.225 direct / 1.475 distributed** |
+| 7 | Sign check (credits stay negative) | **✓ −776.550.095,96 both sides** |
+
+Sign is preserved throughout (`Amount = Debit − Credit`); a credit distributes to
+proportionally negative allocations — no absolute values are ever taken.
+
+## Reconciliation result
+
+| Metric | Value |
+|---|---|
+| Source total (GL) | **Rp 15.282.090.268,93** |
+| Allocated total (Distribution) | **Rp 15.282.090.268,93** |
+| Variance | **Rp 0,00** |
+| GL lines / output rows | 2.437 / 3.700 |
+| Direct / distributed / rejects | 2.225 / 1.475 / 0 |
+
+Validated against the workbook's own `Distribution` sheet: all 1.059
+`(Account, Receiving Dept)` groups match, total residual **Rp 0,01** (one-cent
+rounding across Rp 15,3 bn).
+
+## How to run
+
+```bash
+# validate only (no file written)
+PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --dry-run
+
+# full run → cost_distribution/output/Distribution_output.xlsx
+PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline
+```
+
+Output workbook contains `Distribution`, `Reconciliation`, and (if any) `rejects`.
+Every output row carries a `gl_line_id` internally so any allocated figure traces
+back to its source journal line. See `Automated_Cost_Distribution_Spec.md` for
+the full functional specification.
