@@ -95,6 +95,36 @@ def extract(cfg: Config) -> Dict[str, pd.DataFrame]:
     return sheets
 
 
+def filter_gl_to_period(gl: pd.DataFrame, period: str) -> pd.DataFrame:
+    """Keep only GL lines whose Date falls in ``period`` (YYYY-MM).
+
+    This ties the monthly basis to the GL of the same month: a period's
+    ALLOCATION/FTE/REV factors are applied only to that period's cost lines.
+    Raises if no line matches; warns on lines dropped from other periods or with
+    an unparseable date.
+    """
+    dates = pd.to_datetime(gl["Date"], errors="coerce")
+    gl_period = dates.dt.strftime("%Y-%m")
+    mask = gl_period == period
+
+    n_total = len(gl)
+    n_match = int(mask.sum())
+    n_bad = int(dates.isna().sum())
+    if n_match == 0:
+        raise ValueError(
+            f"No GL lines fall in period {period} (of {n_total} lines). "
+            f"Check --period against the workbook's GL dates."
+        )
+    if n_match < n_total:
+        logger.warning(
+            "GL filtered to period %s: kept %d of %d lines (dropped %d other-period, %d undated)",
+            period, n_match, n_total, n_total - n_match - n_bad, n_bad,
+        )
+    else:
+        logger.info("GL all in period %s (%d lines)", period, n_match)
+    return gl[mask].reset_index(drop=True)
+
+
 # ---------------------------------------------------------------------------
 # 2. Build lookups
 # ---------------------------------------------------------------------------
@@ -390,6 +420,10 @@ def load(cfg: Config, out: pd.DataFrame, rejects: pd.DataFrame, recon: Recon) ->
 def run(cfg: Config, dry_run: bool = False, recompute_basis: bool = False,
         to_db: bool = False, period: str = None, basis_from_db: bool = False):
     sheets = extract(cfg)
+
+    # Tie the run to a month: apply this period's basis only to this period's GL.
+    if period:
+        sheets["GL"] = filter_gl_to_period(sheets["GL"], period)
 
     # Optionally take the reference/basis sheets from the editable MySQL tables
     # for this period instead of the workbook. GL (the monthly fact) still comes

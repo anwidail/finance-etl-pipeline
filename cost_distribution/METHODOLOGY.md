@@ -109,3 +109,9 @@ seeded when empty, unless `--reseed-global`). Output rows and each
 that period's snapshot. Percentages are stored `DECIMAL(30,20)` so FTE/Revenue
 shares still sum to exactly 1 and the allocation ties out. Schema is
 Alembic-managed under `alembic/cost/`.
+
+**Period ties basis to GL.** When `--period` is given, the GL is filtered to
+lines whose date falls in that month, so a period's ALLOCATION/FTE/REV factors
+are applied only to that period's cost lines (the run fails if no GL line
+matches, and warns if lines from other months are dropped). Without `--period`
+the whole workbook GL is processed as one batch.
