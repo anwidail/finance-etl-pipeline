@@ -14,6 +14,7 @@ import pandas as pd
 from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy.orm import sessionmaker
 
+from cost_distribution.periods import date_to_period, period_to_date
 from models.cost_distribution import CostDistributionBase, Distribution, DistributionRun
 
 def get_cost_engine():
@@ -89,7 +90,9 @@ def _rows_from_output(out: pd.DataFrame, run_id: int, loaded_at: datetime,
         row["gl_line_id"] = None if pd.isna(gl_id.iloc[i]) else int(gl_id.iloc[i])
         row["run_id"] = run_id
         rp = row_period.iloc[i]
-        row["period"] = period if pd.isna(rp) else rp
+        p_str = period if pd.isna(rp) else rp
+        # distribution.period is a DATE anchored at the 1st of the month.
+        row["period"] = period_to_date(p_str)
         row["loaded_at"] = loaded_at
         records.append(row)
     return records
@@ -129,13 +132,13 @@ def load_to_db(out: pd.DataFrame, recon, cfg, recompute_basis: bool = False,
         records = _rows_from_output(out, run_id, now, period=period)
 
         # Idempotent snapshot: clear exactly the periods present in this batch
-        # (each period derived per-row from the GL date), then insert.
+        # (each period is a DATE anchored at the 1st of the month), then insert.
         periods = sorted({r["period"] for r in records if r["period"]})
 
-        # Record the run's period: the requested one, else the single period the
-        # output covers (None when a no-period batch spans several months).
+        # distribution_run.period stays MMM-YYYY: the requested period, else the
+        # single month the output covers (None when the batch spans several).
         if run.period is None and len(periods) == 1:
-            run.period = periods[0]
+            run.period = date_to_period(periods[0])
         if periods:
             session.execute(
                 text("DELETE FROM distribution WHERE period IN :ps").bindparams(

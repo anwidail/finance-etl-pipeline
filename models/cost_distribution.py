@@ -32,7 +32,7 @@ class Distribution(CostDistributionBase):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     run_id = Column(Integer, nullable=True, index=True)
-    period = Column(String(10), nullable=True, index=True)  # 'MMM-YYYY'
+    period = Column(Date, nullable=True, index=True)  # month anchored at the 1st, e.g. 2026-04-01
     gl_line_id = Column(Integer, nullable=True, index=True)
 
     date = Column(Date, nullable=True, index=True)
