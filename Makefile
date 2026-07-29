@@ -1,4 +1,4 @@
-.PHONY: venv install run test clean migrate-source migrate-finance migrate rollback-source rollback-finance revision-source revision-finance cost-update cost-check cost-seed cost-close cost-reopen migrate-cost sales-post sales-status sales-check sales-import
+.PHONY: venv install run test clean migrate migrate-finance migrate-cost rollback-finance rollback-cost revision-finance revision-cost cost-update cost-check cost-seed cost-close cost-reopen sales-post sales-status sales-check sales-import
 
 # --- Platform setup ---
 # On Windows, pin the recipe shell to cmd.exe rather than detecting it:
@@ -38,21 +38,39 @@ test:
 	$(ACTIVATE) && pytest tests/ -v
 
 # --- Migrations ---
+#
+# Two independent alembic environments, one per target database:
+#   finance -> FINANCE_DB_NAME          (alembic/finance)
+#   cost    -> COST_DB_NAME             (alembic/cost)
+#
+# alembic/source is deliberately absent here: it targets the live callback
+# source database, which this pipeline only ever reads.
 
-# Apply all pending migrations to both databases
-migrate: migrate-finance
+# Apply all pending migrations to both databases. Finance runs first because
+# the cost distribution reads the ledger it builds.
+migrate: migrate-finance migrate-cost
 
 migrate-finance:
 	$(ACTIVATE) && alembic -c alembic/finance/alembic.ini upgrade head
+
+migrate-cost:
+	$(ACTIVATE) && alembic -c alembic/cost/alembic.ini upgrade head
 
 # Rollback the last migration
 rollback-finance:
 	$(ACTIVATE) && alembic -c alembic/finance/alembic.ini downgrade -1
 
+rollback-cost:
+	$(ACTIVATE) && alembic -c alembic/cost/alembic.ini downgrade -1
+
 # Auto-generate a new migration from model changes
-# Usage: make revision-source msg="add index to transactions"
+# Usage: make revision-finance msg="add index to transactions"
 revision-finance:
 	$(ACTIVATE) && alembic -c alembic/finance/alembic.ini revision --autogenerate -m "$(msg)"
+
+# Usage: make revision-cost msg="add basis column"
+revision-cost:
+	$(ACTIVATE) && alembic -c alembic/cost/alembic.ini revision --autogenerate -m "$(msg)"
 
 # --- Sales detail (manually imported sales invoices) ---
 
@@ -110,9 +128,6 @@ cost-close:
 cost-reopen:
 	@test -n "$(P)" || { echo "Usage: make cost-reopen P=JUL-2026"; exit 1; }
 	venv/bin/python -m cost_distribution.pipeline --reopen-period --period $(P)
-
-migrate-cost:
-	venv/bin/alembic -c alembic/cost/alembic.ini upgrade head
 
 clean:
 	$(RM_VENV)

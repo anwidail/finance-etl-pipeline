@@ -158,26 +158,34 @@ mysql -u etl_user -p finance_db < data/seed_finance_tables.sql
 
 Migrations are managed with [Alembic](https://alembic.sqlalchemy.org/).
 
-Two migration tracks are used:
-- **source** → for raw callback tables (`database_a`)  
-- **finance** → for structured transaction and reporting tables (`finance_db`)  
+Three migration tracks exist, one per database:
+- **finance** (`alembic/finance`) → structured transaction and reporting tables (`FINANCE_DB_NAME`)
+- **cost** (`alembic/cost`) → cost distribution output and basis tables (`COST_DB_NAME`)
+- **source** (`alembic/source`) → raw callback tables (`SOURCE_DB_NAME`)
+
+Only finance and cost have `make` targets. The source database is the live
+callback feed that this pipeline only reads, so it is deliberately not wired up
+— run it by hand if you ever genuinely need to.
 
 ```bash
-# Apply all migrations
+# Apply all migrations (finance first, then cost)
 make migrate
 
 # Apply per database
-make migrate-source
 make migrate-finance
+make migrate-cost
 
-# Rollback
-make rollback-source
+# Rollback the last migration
 make rollback-finance
+make rollback-cost
 
-# Generate migration
-make revision-source msg="add index to zahir_api_callbacks_raw"
+# Generate a migration from model changes (alembic autogenerate)
 make revision-finance msg="add unique key to sales_invoice"
+make revision-cost msg="add basis column to basis_allocation"
 ```
+
+`revision-*` only writes a new file under `alembic/<track>/versions/` — review it,
+then apply it with `make migrate`.
 
 ---
 
