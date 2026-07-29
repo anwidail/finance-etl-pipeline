@@ -1,18 +1,52 @@
-"""Period helpers — a month written MMM-YYYY (e.g. APR-2026), derived from a date.
+"""Time helpers — the period label (MMM-YYYY, e.g. APR-2026) and the wall clock.
 
 Kept in its own module so both the pipeline and the DB loaders can derive/parse
-periods without importing each other.
+periods, and stamp rows, without importing each other.
 """
 from __future__ import annotations
 
 import re
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
+
+# Western Indonesian Time (Jakarta), UTC+7 with no daylight saving — so a fixed
+# offset is exact, and does not depend on the host or MySQL server's own
+# timezone configuration.
+JAKARTA = timezone(timedelta(hours=7), name="WIB")
+
+
+def now_jakarta() -> datetime:
+    """Current Jakarta wall-clock time, naive — the clock every stamp uses.
+
+    Returned without tzinfo because the ``created_at``/``updated_at`` columns are
+    plain ``DATETIME``: the value stored *is* local Jakarta time. Keeping one
+    clock across the loaders and the database matters more than the choice
+    itself — mixed clocks make the audit trail unreadable.
+    """
+    return datetime.now(JAKARTA).replace(tzinfo=None)
 
 # Fixed English month abbreviations (locale-independent).
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
           "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+
+# Indonesian month names — the workbook writes its audit labels in Indonesian
+# (e.g. the overhead sweep's "FTE : PC Juni"). Hard-coded rather than taken from
+# the C locale so the label is identical on every machine.
+MONTHS_ID = ["Januari", "Februari", "Maret", "April", "Mei", "Juni",
+             "Juli", "Agustus", "September", "Oktober", "November", "Desember"]
+
+
+def previous_period(period: str) -> str:
+    """'JUL-2026' -> 'JUN-2026' (the month before, same MMM-YYYY form)."""
+    s = normalize_period(str(period))
+    idx, year = MONTHS.index(s[:3]), int(s[4:])
+    return f"{MONTHS[idx - 1]}-{year if idx else year - 1}"
+
+
+def month_name_id(period: str) -> str:
+    """'JUN-2026' -> 'Juni' — the Indonesian month name used in audit labels."""
+    return MONTHS_ID[MONTHS.index(normalize_period(str(period))[:3])]
 
 
 def date_to_period(value) -> str | None:

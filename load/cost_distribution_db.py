@@ -8,13 +8,13 @@ source connection pattern in ``etl_pipeline.py``.
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime
 
 import pandas as pd
 from sqlalchemy import bindparam, create_engine, text
 from sqlalchemy.orm import sessionmaker
 
-from cost_distribution.periods import date_to_period, period_to_date
+from cost_distribution.periods import now_jakarta, period_to_date
 from models.cost_distribution import CostDistributionBase, Distribution, DistributionRun
 
 def get_cost_engine():
@@ -40,7 +40,34 @@ def get_cost_engine():
     return create_engine(url, future=True)
 
 
-# Map the tidy output frame's display columns to the ORM column names.
+def get_finance_engine():
+    """Build the accounting (finance) DB engine — the GL fact's upstream source.
+
+    Same call-time env reading as ``get_cost_engine`` (and the same shape as
+    ``etl_pipeline.get_finance_engine``), kept here so the cost_distribution
+    package can reach accounting.gl without importing the whole ETL module.
+    """
+    url_override = os.getenv("FINANCE_DB_URL")
+    if url_override:
+        return create_engine(url_override, future=True)
+    cfg = {
+        "host": os.getenv("FINANCE_DB_HOST", "localhost"),
+        "port": int(os.getenv("FINANCE_DB_PORT", "3306")),
+        "user": os.getenv("FINANCE_DB_USER", "your_user"),
+        "password": os.getenv("FINANCE_DB_PASSWORD", "your_password"),
+        "database": os.getenv("FINANCE_DB_NAME", "accounting"),
+    }
+    url = (
+        f"mysql+mysqlconnector://{cfg['user']}:{cfg['password']}"
+        f"@{cfg['host']}:{cfg['port']}/{cfg['database']}"
+    )
+    return create_engine(url, future=True)
+
+
+# Map the pipeline frame's internal column names to the ORM column names. These
+# are the internal names, not the workbook headers — only the written sheet takes
+# the workbook's spelling (see config.OUTPUT_HEADERS), so "Div" here lands in
+# ``distribution.dept_div``.
 _COLUMN_MAP = {
     "Date": "date",
     "Type": "type",
@@ -51,10 +78,14 @@ _COLUMN_MAP = {
     "Code": "code",
     "Account Name": "account_name",
     "Account": "account",
+    "Reporting Code": "reporting_code",
     "Reporting Account Name": "reporting_account_name",
+    "Reporting Account": "reporting_account",
+    "Dept Code": "dept_code",
     "Dept": "dept",
+    "New Dept Code": "new_dept_code",
     "New Dept": "new_dept",
-    "Div": "div",
+    "Div": "dept_div",
     "PC": "pc",
     "Debit": "debit",
     "Credit": "credit",
@@ -108,12 +139,12 @@ def load_to_db(out: pd.DataFrame, recon, cfg, recompute_basis: bool = False,
     engine = engine or get_cost_engine()
     create_all(engine)
     Session = sessionmaker(bind=engine, future=True)
-    now = datetime.now(timezone.utc)
+    now = now_jakarta()
 
     with Session() as session:
         run = DistributionRun(
             run_at=now,
-            period=period,
+            period=period_to_date(period),
             source_total=recon.source_total,
             allocated_total=recon.allocated_total,
             variance=recon.variance,
@@ -135,10 +166,18 @@ def load_to_db(out: pd.DataFrame, recon, cfg, recompute_basis: bool = False,
         # (each period is a DATE anchored at the 1st of the month), then insert.
         periods = sorted({r["period"] for r in records if r["period"]})
 
-        # distribution_run.period stays MMM-YYYY: the requested period, else the
-        # single month the output covers (None when the batch spans several).
+        # distribution_run.period is a DATE anchored at the 1st: the requested
+        # period, else the single month the output covers (None when the batch
+        # spans several). `periods` already hold DATE values from _rows_from_output.
         if run.period is None and len(periods) == 1:
-            run.period = date_to_period(periods[0])
+            run.period = periods[0]
+
+        # Gate on the months this batch actually writes. A run invoked without
+        # --period would otherwise skip the period lock entirely and overwrite a
+        # closed month's snapshot; raising here rolls the whole load back.
+        from load.cost_distribution_period import assert_periods_open
+        assert_periods_open(session, periods, "write cost_distribution_db")
+
         if periods:
             session.execute(
                 text("DELETE FROM distribution WHERE period IN :ps").bindparams(

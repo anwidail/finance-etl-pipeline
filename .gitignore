@@ -7,3 +7,6 @@ __pycache__/
 
 # Generated ETL diagnostic report — contains production contact names & amounts
 failing_docs.csv
+# Source workbooks — production GL, customers, payroll headcount
+*.xls
+*.xlsx

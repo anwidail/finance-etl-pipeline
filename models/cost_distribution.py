@@ -10,11 +10,12 @@ reconciliation summary.
 - ``distribution_run`` — one row per pipeline run (the reconciliation controls)
 """
 
-from datetime import datetime, timezone
 from sqlalchemy import (
-    Column, Integer, BigInteger, String, Numeric, Date, DateTime, Text,
+    Column, Integer, BigInteger, String, Numeric, Date, DateTime, Text, func,
 )
 from sqlalchemy.orm import declarative_base
+
+from cost_distribution.periods import now_jakarta
 
 CostDistributionBase = declarative_base()
 
@@ -45,11 +46,21 @@ class Distribution(CostDistributionBase):
     code = Column(String(50), nullable=True, index=True)
     account_name = Column(String(200), nullable=True)
     account = Column(String(260), nullable=True)
+    # Reporting line, its code and the "<code> <line>" label — all from COA.
+    reporting_code = Column(String(50), nullable=True, index=True)
     reporting_account_name = Column(String(200), nullable=True)
+    reporting_account = Column(String(260), nullable=True)
 
+    # Both departments carry their code as well as their name: the code is the
+    # reference, the name a label that renames out from under you. `dept_code`
+    # comes from the GL line; `new_dept_code` is resolved from the PC master,
+    # because the receiving department is chosen by ALLOCATION, which is
+    # authored by name.
+    dept_code = Column(String(50), nullable=True, index=True)
     dept = Column(String(200), nullable=True, index=True)
+    new_dept_code = Column(String(50), nullable=True, index=True)
     new_dept = Column(String(200), nullable=True, index=True)
-    div = Column(String(200), nullable=True, index=True)
+    dept_div = Column(String(200), nullable=True, index=True)
     pc = Column(String(200), nullable=True, index=True)
 
     debit = Column(Numeric(18, 2), nullable=False, default=0)
@@ -71,7 +82,7 @@ class DistributionRun(CostDistributionBase):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     run_at = Column(DateTime, nullable=True, index=True)
-    period = Column(String(10), nullable=True, index=True)  # 'MMM-YYYY'
+    period = Column(Date, nullable=True, index=True)  # month anchored at the 1st, e.g. 2026-04-01
 
     source_total = Column(Numeric(20, 2), nullable=True)
     allocated_total = Column(Numeric(20, 2), nullable=True)
@@ -101,19 +112,39 @@ class DistributionRun(CostDistributionBase):
 #     so they carry no ``period`` (one current version).
 #   * Monthly tables (ALLOCATION, FTE, REV) — the split factors and their
 #     headcount/revenue drivers change each month, so every row carries a
-#     ``period`` (YYYY-MM) and each month has its own editable version.
+#     ``period`` (a DATE anchored at the 1st of the month) and each month has
+#     its own editable version.
 
 
 class _RefMixin:
-    """Shared columns for every basis table (no period)."""
+    """Shared columns for every basis table (no period).
+
+    ``created_at``/``updated_at`` are maintained by the *database*, so a row
+    edited by hand in SQL is stamped exactly like one written by the loaders:
+
+    - insert  -> column default
+    - update  -> a ``BEFORE UPDATE`` trigger (see the Alembic revision)
+
+    All stamps are **Jakarta local time (WIB, UTC+7)** — the clock
+    ``periods.now_jakarta`` returns, which the loaders use for every write. MySQL
+    gets ``UTC_TIMESTAMP() + INTERVAL 7 HOUR`` from the migration rather than
+    ``CURRENT_TIMESTAMP`` so the value is WIB regardless of the database host's
+    own timezone.
+
+    The Python-side ``default``/``onupdate`` below keep the same clock on
+    backends without the trigger (the test suite's SQLite, or a bare
+    ``create_all`` bootstrap); the migration is the authoritative schema.
+    """
     id = Column(Integer, primary_key=True, autoincrement=True)
-    created_at = Column(DateTime, nullable=True)
-    updated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=now_jakarta,
+                        server_default=func.now())
+    updated_at = Column(DateTime, nullable=False, default=now_jakarta,
+                        onupdate=now_jakarta, server_default=func.now())
 
 
 class _PeriodMixin(_RefMixin):
     """Basis tables scoped to a month."""
-    period = Column(String(10), nullable=False, index=True)  # 'MMM-YYYY'
+    period = Column(Date, nullable=False, index=True)  # month anchored at the 1st, e.g. 2026-04-01
 
 
 class BasisPC(CostDistributionBase, _RefMixin):
@@ -126,11 +157,35 @@ class BasisPC(CostDistributionBase, _RefMixin):
 
 
 class BasisCOA(CostDistributionBase, _RefMixin):
-    """Chart of accounts (workbook sheet ``COA``) — policy, no period."""
+    """Chart of accounts (workbook sheet ``COA``) — policy, no period.
+
+    Each account resolves to a reporting line: ``reporting_code`` is the line's
+    id in the ``basis_rl`` master, ``reporting_line`` its name, and
+    ``reporting_account`` the "<code> <name>" label the output carries.
+    """
     __tablename__ = "basis_coa"
     code = Column(String(50), nullable=True, index=True)
     account_name = Column(String(200), nullable=True)
+    reporting_code = Column(String(50), nullable=True, index=True)
     reporting_line = Column(String(200), nullable=True)
+    reporting_account = Column(String(260), nullable=True)
+
+
+class BasisRL(CostDistributionBase, _RefMixin):
+    """Reporting-line master (workbook sheet ``RL``) — policy, no period.
+
+    The group reporting hierarchy each COA account rolls up to: a head
+    (``head_code``/``head_description``) containing reporting lines. Reference
+    data — the pipeline reads the resolved line off COA — kept here so the
+    hierarchy is queryable alongside the rest of the basis.
+    """
+    __tablename__ = "basis_rl"
+    head_code = Column(String(50), nullable=True, index=True)
+    head_description = Column(String(200), nullable=True)
+    reporting_line = Column(String(50), nullable=True, index=True)
+    reporting_line_name = Column(String(200), nullable=True)
+    reporting_code = Column(String(50), nullable=True, index=True)
+    description = Column(String(300), nullable=True)
 
 
 class BasisLogic(CostDistributionBase, _RefMixin):
@@ -153,6 +208,10 @@ class BasisAllocation(CostDistributionBase, _PeriodMixin):
     """
     __tablename__ = "basis_allocation"
     distribution = Column(String(100), nullable=True, index=True)  # method
+    # Where this row's percentage comes from: 'basis_fte' (headcount share),
+    # 'basis_rev' (revenue share) or 'Fixed' (hand-maintained, never recomputed).
+    # Derived from the method — see cost_distribution.basis.basis_of.
+    basis = Column(String(20), nullable=True, index=True)
     account_name = Column(String(200), nullable=True, index=True)
     new_dept = Column(String(200), nullable=True, index=True)
     # High precision: FTE/Revenue shares are repeating decimals that must sum to
@@ -199,6 +258,9 @@ class GLEntry(CostDistributionBase, _PeriodMixin):
     contact = Column(String(200), nullable=True)
     description = Column(Text, nullable=True)
     note = Column(Text, nullable=True)
+    # Department as the source states it: the code is the stable key, the name
+    # only a label. Nullable because not every feed carries one (sales_detail).
+    dept_code = Column(String(50), nullable=True, index=True)
     dept = Column(String(200), nullable=True, index=True)
     project = Column(String(200), nullable=True)
     curr = Column(String(10), nullable=True)
@@ -209,6 +271,7 @@ class GLEntry(CostDistributionBase, _PeriodMixin):
     balance = Column(Numeric(28, 12), nullable=True)
     account_code = Column(String(50), nullable=True, index=True)
     account_name = Column(String(200), nullable=True, index=True)
+    note2 = Column(Text, nullable=True)  # reviewer annotation column (V.05)
 
 
 class PeriodClose(CostDistributionBase):
@@ -220,7 +283,7 @@ class PeriodClose(CostDistributionBase):
     """
 
     __tablename__ = "period_close"
-    period = Column(String(10), primary_key=True)  # 'MMM-YYYY'
+    period = Column(Date, primary_key=True)  # month anchored at the 1st, e.g. 2026-04-01
     status = Column(String(10), nullable=False, default="closed")  # closed
     closed_at = Column(DateTime, nullable=True)
     note = Column(String(300), nullable=True)

@@ -27,8 +27,32 @@ from cost_distribution.config import Config
 logger = logging.getLogger("cost_distribution.basis")
 
 
+# Values of the ``basis`` column on ALLOCATION / basis_allocation.
+BASIS_FTE = "basis_fte"
+BASIS_REV = "basis_rev"
+BASIS_FIXED = "Fixed"
+
+
 def _strip(s: pd.Series) -> pd.Series:
     return s.astype("string").str.strip()
+
+
+def basis_of(cfg: Config, method) -> str:
+    """Which source drives a method's percentages — the single rule everything uses.
+
+    Anything not configured as FTE- or revenue-driven is ``Fixed``: a
+    hand-maintained split the recompute must leave alone.
+    """
+    if method in cfg.fte_scopes:
+        return BASIS_FTE
+    if method in cfg.rev_method_column:
+        return BASIS_REV
+    return BASIS_FIXED
+
+
+def basis_column(cfg: Config, methods: pd.Series) -> pd.Series:
+    """Vectorised :func:`basis_of` over a column of method names."""
+    return _strip(methods).map(lambda m: basis_of(cfg, m))
 
 
 def recompute_fte_factors(cfg: Config, fte: pd.DataFrame, roster: Dict[str, list]) -> pd.DataFrame:
@@ -40,12 +64,22 @@ def recompute_fte_factors(cfg: Config, fte: pd.DataFrame, roster: Dict[str, list
     """
     f = fte.copy()
     f["Dept"] = _strip(f["Dept"])
-    f["Location"] = _strip(f["Location"])
     f["HC"] = pd.to_numeric(f["HC"], errors="raise")
 
     rows = []
-    for method, token in cfg.fte_scopes.items():
-        scope = f if token is None else f[f["Location"].str.contains(token, case=False, na=False)]
+    for method, (column, token) in cfg.fte_scopes.items():
+        if token is None:
+            scope = f
+        else:
+            if column not in f.columns:
+                raise ValueError(
+                    f"FTE scope for {method!r} needs column {column!r}, which the "
+                    f"FTE register does not have (has: {list(f.columns)})."
+                )
+            scope = f[_strip(f[column]).str.contains(token, case=False, na=False, regex=False)]
+            if scope.empty:
+                logger.warning("FTE scope %r (%s contains %r) matched no employees",
+                               method, column, token)
         share = scope.groupby("Dept")["HC"].sum()
         total = share.sum()
         share = share / total if total else share
@@ -108,9 +142,54 @@ def recompute_allocation(cfg: Config, alloc: pd.DataFrame, fte: pd.DataFrame,
 
     passthrough = a[~a["Distribution"].isin(recomputed_methods)].copy()
     refreshed = pd.concat([passthrough, fte_long, rev_long], ignore_index=True)
-    logger.info("recomputed basis for %d methods (%d rows)",
-                len(recomputed_methods), len(fte_long) + len(rev_long))
+    # Stamp every row with its source, so the stored basis is self-describing.
+    refreshed["Basis"] = basis_column(cfg, refreshed["Distribution"])
+    # Spell out which basis each method came from, so the result can be checked
+    # against the basis map without reading config.
+    present = set(a["Distribution"].dropna())
+    logger.info("basis_fte  -> %s", sorted(present & set(fte_methods)) or "none")
+    logger.info("basis_rev  -> %s", sorted(present & set(rev_methods)) or "none")
+    logger.info("fixed (unchanged) -> %s", sorted(present - recomputed_methods) or "none")
+    unknown = recomputed_methods - present
+    if unknown:
+        logger.warning("configured basis methods absent from ALLOCATION: %s", sorted(unknown))
+    logger.info("recomputed basis for %d methods (%d of %d rows)",
+                len(present & recomputed_methods),
+                len(fte_long) + len(rev_long), len(refreshed))
     return refreshed
+
+
+def drift_by_method(cfg: Config, refreshed: pd.DataFrame,
+                    authoritative: pd.DataFrame) -> pd.DataFrame:
+    """Per-method comparison of stored factors against what FTE/REV imply.
+
+    One row per distribution method: where its percentages come from, how far the
+    stored `ALLOCATION` has drifted from a fresh recompute, and whether the set
+    still sums to 1. `Fixed` methods are reported too — their drift is 0 by
+    construction, which is itself worth showing.
+    """
+    def keyed(df):
+        d = df.copy()
+        d["Distribution"] = _strip(d["Distribution"])
+        d["New Dept"] = _strip(d["New Dept"])
+        return d.groupby(["Distribution", "New Dept"])["Percentage"].sum()
+
+    ref, auth = keyed(refreshed), keyed(authoritative)
+    joined = pd.concat([auth.rename("stored"), ref.rename("recomputed")], axis=1).fillna(0.0)
+    joined["drift"] = (joined["stored"] - joined["recomputed"]).abs()
+
+    rows = []
+    for method, grp in joined.groupby(level="Distribution"):
+        rows.append({
+            "method": method,
+            "basis": basis_of(cfg, method),
+            "depts": len(grp),
+            "sum_stored": round(float(grp["stored"].sum()), 9),
+            "max_drift": float(grp["drift"].max()),
+            "in_sync": bool(grp["drift"].max() <= cfg.tolerance),
+        })
+    out = pd.DataFrame(rows).sort_values(["basis", "method"]).reset_index(drop=True)
+    return out
 
 
 def verify_against(cfg: Config, refreshed: pd.DataFrame, authoritative: pd.DataFrame) -> float:

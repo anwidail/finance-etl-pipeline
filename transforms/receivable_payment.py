@@ -223,6 +223,7 @@ def normalize_base_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         "ref_no": data.get("number"),
         "contact": customer.get("name"),
         "description": data.get("description"),
+        "dept_code": department.get("code"),
         "department": department.get("name"),
         "project": project.get("name"),
         "source_id": data.get("id"),
@@ -360,6 +361,7 @@ def transform_receivable_payment(payload: Dict[str, Any]) -> List[Dict[str, Any]
 
         line_base = {
             **base,
+            "dept_code": dept.get("code"),
             "department": dept.get("name"),
             "project": proj.get("name"),
             "currency": line_currency,

@@ -20,6 +20,7 @@ COMMON_COLUMNS = [
     "contact",
     "description",
     "note",
+    "dept_code",
     "department",
     "project",
     "debit",
@@ -71,6 +72,10 @@ COMMON_UPDATE_COLUMNS = [
     "contact",
     "description",
     "note",
+    # Kept next to `department`: a document re-posted under a different
+    # department must refresh both halves, or the code goes stale against the
+    # name it sits beside.
+    "dept_code",
     "department",
     "project",
     "debit",
