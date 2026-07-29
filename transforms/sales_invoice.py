@@ -4,32 +4,9 @@ import json
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
+from transforms.timeutil import to_wib
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-# Mapping pajak -> akun GL
-# Sesuaikan dengan COA perusahaan Anda
-TAX_ACCOUNT_MAP = {
-    "PPN 11%": {
-        "account_code": "214111",
-        "coa_name": "Output VAT 11%",
-    },
-    "PPN 12%": {
-        "account_code": "214112",
-        "coa_name": "Output VAT 12%",
-    },
-    "PPh 23": {
-        "account_code": "214511",
-        "coa_name": "Withholding Tax Article 23",
-    },
-}
-
-DEFAULT_TAX_ACCOUNT = {
-    "account_code": "214999",
-    "coa_name": "Other Output Tax",
-}
+from transforms.tax_master import resolve_discount_account, resolve_tax_account
 
 
 # ============================================================
@@ -76,22 +53,6 @@ def compute_realization(account_code: Optional[str], debit: Decimal, credit: Dec
     if first_digit in (2, 3, 4, 8):
         return -base
     return base
-
-
-def get_tax_account(tax_obj: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Resolve tax GL account based on tax code or tax name.
-    """
-    tax_code = (tax_obj.get("code") or "").strip()
-    tax_name = (tax_obj.get("name") or "").strip()
-
-    if tax_code in TAX_ACCOUNT_MAP:
-        return TAX_ACCOUNT_MAP[tax_code]
-
-    if tax_name in TAX_ACCOUNT_MAP:
-        return TAX_ACCOUNT_MAP[tax_name]
-
-    return DEFAULT_TAX_ACCOUNT
 
 
 def parse_json_body(raw_body: Any) -> Dict[str, Any]:
@@ -181,13 +142,14 @@ def normalize_base_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         "ref_no": data.get("number"),
         "contact": customer.get("name"),
         "description": data.get("description"),
+        "dept_code": department.get("code"),
         "department": department.get("name"),
         "project": project.get("name"),
         "source_id": data.get("id"),
         "status": data.get("status"),
         "currency": currency.get("code") or "IDR",
         "exchange_rate": to_decimal(data.get("exchange_rate", 1)),
-        "created_at": created.get("time"),
+        "created_at": to_wib(created.get("time")),
         "created_by": created_user.get("name"),
     }
 
@@ -262,7 +224,7 @@ def transform_sales_invoice(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "note": "Accounts Receivable",
             "debit": debit,
             "credit": credit,
-            "realization": compute_realization(account_code, debit, credit),
+            "amount": compute_realization(account_code, debit, credit),
             "account_code": account_code,
             "coa_name": acc.get("name"),
             "source_line_id": to_str(pay.get("id")),
@@ -281,18 +243,25 @@ def transform_sales_invoice(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         line_base = {
             **base,
+            "dept_code": dept.get("code"),
             "department": dept.get("name"),
             "project": proj.get("name"),
             "currency": curr.get("code") or base["currency"],
             "exchange_rate": to_decimal(line.get("exchange_rate", base["exchange_rate"])),
         }
 
-        # Revenue
-        revenue_amount = to_decimal(
+        # Revenue is credited GROSS (at the pre-discount subtotal); the line
+        # discount is posted separately to Pre TA 23 as a debit. Grossing up and
+        # debiting the same discount offsets exactly, so a zero discount leaves
+        # the entry identical to a plain net posting.
+        before_amount = to_decimal(line.get("subtotal_before_discount"))
+        after_amount = to_decimal(
             line.get("subtotal_after_discount")
             if line.get("subtotal_after_discount") is not None
             else line.get("subtotal_before_discount")
         )
+        revenue_amount = before_amount
+        discount_amount = before_amount - after_amount
 
         if revenue_amount != 0:
             debit = Decimal("0")
@@ -304,10 +273,23 @@ def transform_sales_invoice(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "note": line.get("description") or "Revenue",
                 "debit": debit,
                 "credit": credit,
-                "realization": compute_realization(account_code, debit, credit),
+                "amount": compute_realization(account_code, debit, credit),
                 "account_code": account_code,
                 "coa_name": acc.get("name"),
                 "source_line_id": to_str(line.get("id")),
+            })
+
+        if discount_amount != 0:
+            disc_code, disc_coa_name = resolve_discount_account("sales")
+            rows.append({
+                **line_base,
+                "note": "Discount",
+                "debit": discount_amount,
+                "credit": Decimal("0"),
+                "amount": compute_realization(disc_code, discount_amount, Decimal("0")),
+                "account_code": disc_code,
+                "coa_name": disc_coa_name,
+                "source_line_id": f"{to_str(line.get('id'))}_disc",
             })
 
         # Tax
@@ -316,8 +298,7 @@ def transform_sales_invoice(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             if tax_amount == 0:
                 continue
 
-            tax_account = get_tax_account(tax)
-            tax_code = tax_account["account_code"]
+            tax_code, tax_coa_name = resolve_tax_account(tax, "sales")
 
             debit = Decimal("0")
             credit = tax_amount
@@ -327,10 +308,12 @@ def transform_sales_invoice(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "note": tax.get("name") or tax.get("code") or "Tax",
                 "debit": debit,
                 "credit": credit,
-                "realization": compute_realization(tax_code, debit, credit),
+                "amount": compute_realization(tax_code, debit, credit),
                 "account_code": tax_code,
-                "coa_name": tax_account["coa_name"],
-                "source_line_id": to_str(tax.get("id")),
+                "coa_name": tax_coa_name,
+                # tax.id is the tax-type id (shared across line items), so prefix
+                # with the line id to keep (source_id, source_line_id) unique.
+                "source_line_id": f"{to_str(line.get('id'))}_{to_str(tax.get('id'))}_tax",
             })
 
     if not rows:

@@ -4,3 +4,9 @@ __pycache__/
 *.pyc
 *.log
 .DS_Store
+
+# Generated ETL diagnostic report — contains production contact names & amounts
+failing_docs.csv
+# Source workbooks — production GL, customers, payroll headcount
+*.xls
+*.xlsx

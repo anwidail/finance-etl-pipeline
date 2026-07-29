@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(PYTHONPATH=. ./venv/bin/alembic -c alembic/cost/alembic.ini revision --autogenerate -m \"widen period columns to 10 for MMM-YYYY\")",
+      "Bash(PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --to-db)",
+      "Bash(PYTHONPATH=. ./venv/bin/python -c \"import cost_distribution.pipeline, load.cost_distribution_db, load.cost_distribution_basis; print\\('imports OK'\\)\")",
+      "Bash(PYTHONPATH=. ./venv/bin/alembic -c alembic/cost/alembic.ini revision --autogenerate -m \"add gl_entry fact table\")",
+      "Bash(PYTHONPATH=. ./venv/bin/python -c \"import cost_distribution.pipeline, load.cost_distribution_gl; print\\('OK'\\)\")",
+      "Bash(PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --import-gl --period APR-2026)",
+      "Bash(PYTHONPATH=. ./venv/bin/alembic -c alembic/cost/alembic.ini revision --autogenerate -m \"widen gl_entry amount precision\")",
+      "Bash(PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --gl-from-db --basis-from-db --period APR-2026 --to-db)",
+      "Bash(PYTHONPATH=. ./venv/bin/alembic -c alembic/cost/alembic.ini revision --autogenerate -m \"add period_close lock table\")",
+      "Bash(PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --gl-from-db --basis-from-db --recompute-basis --period APR-2026 --to-db)",
+      "Bash(PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --close-period --period APR-2026 --note \"April closed for reporting\")",
+      "Bash(PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --import-basis --period APR-2026)",
+      "Bash(PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --gl-from-db --basis-from-db --period APR-2026 --dry-run)",
+      "Bash(PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --reopen-period --period APR-2026)",
+      "Bash(PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --close-period --period APR-2026)",
+      "Bash(PYTHONPATH=. ./venv/bin/python -m cost_distribution.pipeline --gl-from-db --basis-from-db --period APR-2026)"
+    ]
+  }
+}
