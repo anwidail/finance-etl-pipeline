@@ -264,13 +264,6 @@ class SalesDetail(FinanceBase):
 
     __tablename__ = "sales_detail"
 
-    __table_args__ = (
-        UniqueConstraint("source_id", "source_line_id", name="uq_cash_in_source_line"),
-    )
-
-
-class CashOut(FinanceBase, TransactionLineMixin):
-    __tablename__ = "cash_out"
     id = Column(Integer, primary_key=True, autoincrement=True)
 
     date = Column(Date, nullable=False, index=True)
