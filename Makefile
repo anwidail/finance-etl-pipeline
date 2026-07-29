@@ -1,17 +1,41 @@
 .PHONY: venv install run test clean migrate-source migrate-finance migrate rollback-source rollback-finance revision-source revision-finance cost-update cost-check cost-seed cost-close cost-reopen migrate-cost sales-post sales-status sales-check sales-import
 
+# --- Platform setup ---
+# On Windows, pin the recipe shell to cmd.exe rather than detecting it:
+# make defaults $(SHELL) to the literal "/bin/sh" even when no sh exists,
+# so the variable cannot be trusted to say how recipes will actually run.
+ifeq ($(OS),Windows_NT)
+    SHELL       := cmd.exe
+    .SHELLFLAGS := /c
+    VENV_BIN    := venv\Scripts
+    PY          := python
+    ACTIVATE    := $(VENV_BIN)\activate.bat
+    RM_VENV      = if exist venv rmdir /s /q venv
+    RM_CACHE     = if exist __pycache__ rmdir /s /q __pycache__
+    RM_LOGS      = del /q *.log 2>nul || exit 0
+else
+    VENV_BIN    := venv/bin
+    PY          := python3
+    # Each recipe line runs in its own shell, so the venv must be activated
+    # per-command rather than once up front.
+    ACTIVATE    := . $(VENV_BIN)/activate
+    RM_VENV      = rm -rf venv
+    RM_CACHE     = rm -rf __pycache__
+    RM_LOGS      = rm -f *.log
+endif
+
 venv:
-	python3 -m venv venv
+	$(PY) -m venv venv
 
 install: venv
-	venv/bin/pip install --upgrade pip
-	venv/bin/pip install -r requirements.txt
+	$(ACTIVATE) && pip install --upgrade pip
+	$(ACTIVATE) && pip install -r requirements.txt
 
 run:
-	venv/bin/python etl_pipeline.py
+	$(ACTIVATE) && python etl_pipeline.py
 
 test:
-	venv/bin/pytest tests/ -v
+	$(ACTIVATE) && pytest tests/ -v
 
 # --- Migrations ---
 
@@ -19,16 +43,16 @@ test:
 migrate: migrate-finance
 
 migrate-finance:
-	venv/bin/alembic -c alembic/finance/alembic.ini upgrade head
+	$(ACTIVATE) && alembic -c alembic/finance/alembic.ini upgrade head
 
 # Rollback the last migration
 rollback-finance:
-	venv/bin/alembic -c alembic/finance/alembic.ini downgrade -1
+	$(ACTIVATE) && alembic -c alembic/finance/alembic.ini downgrade -1
 
 # Auto-generate a new migration from model changes
 # Usage: make revision-source msg="add index to transactions"
 revision-finance:
-	venv/bin/alembic -c alembic/finance/alembic.ini revision --autogenerate -m "$(msg)"
+	$(ACTIVATE) && alembic -c alembic/finance/alembic.ini revision --autogenerate -m "$(msg)"
 
 # --- Sales detail (manually imported sales invoices) ---
 
@@ -91,4 +115,6 @@ migrate-cost:
 	venv/bin/alembic -c alembic/cost/alembic.ini upgrade head
 
 clean:
-	rm -rf venv __pycache__ *.log
+	$(RM_VENV)
+	$(RM_CACHE)
+	$(RM_LOGS)
